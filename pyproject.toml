@@ -1,0 +1,57 @@
+[build-system]
+build-backend = "hatchling.build"
+requires = [ "hatchling" ]
+
+[project]
+name = "mlcast-verification-tools"
+version = "0.1.0"
+description = "Verification scores and plots for precipitation nowcasts, stored in the MLCast forecast_scoring_metrics format"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [
+  { name = "Leif Denby", email = "lcd@dmi.dk" },
+]
+requires-python = ">=3.11"
+dependencies = [
+  "matplotlib>=3.8",
+  "netcdf4>=1.6",
+  "numpy>=2",
+  "pandas>=2",
+  "xarray>=2025.6.1",
+  "zarr>=3",
+]
+
+optional-dependencies.compute = [
+  "torch>=2.7.1",
+]
+optional-dependencies.mlcast = [
+  "mlcast",
+  "pytorch-lightning>=2",
+  "torch>=2.7.1",
+  # mlcast.visualization imports torchvision at module level, but mlcast only lists it
+  # in its own torch extras
+  "torchvision>=0.20",
+]
+scripts."mlcast.verify" = "mlcast_verification_tools.cli:main"
+
+[dependency-groups]
+dev = [
+  "mlcast-dataset-validator",
+  "pytest>=8",
+]
+
+[tool.uv.sources]
+mlcast = { path = "../mlcast", editable = true }
+mlcast-dataset-validator = { git = "https://github.com/leifdenby/mlcast-dataset-validator", branch = "feat/verification-metrics-spec" }
+
+[tool.hatch.build.targets.wheel]
+packages = [ "src/mlcast_verification_tools" ]
+
+[tool.pytest.ini_options]
+testpaths = [ "tests" ]
+markers = [
+  "network: test needs network access (validator checks GitHub URLs)",
+]
+
+[tool.ruff]
+line-length = 100
