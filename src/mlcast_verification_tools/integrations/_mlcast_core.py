@@ -132,12 +132,18 @@ def denormalize_torch(
     if not torch.is_floating_point(x):
         raise TypeError(f"expected a floating point tensor, got {x.dtype}")
     s = scaling or DEFAULT_SCALING
-    dbz = s.dbz_floor + (x - s.norm_min) * ((s.dbz_ceiling - s.dbz_floor) / (s.norm_max - s.norm_min))
+    dbz = s.dbz_floor + (x - s.norm_min) * (
+        (s.dbz_ceiling - s.dbz_floor) / (s.norm_max - s.norm_min)
+    )
     rate = torch.pow(10.0, (dbz - 10.0 * math.log10(s.a)) / (10.0 * s.b))
-    return torch.where(dbz <= s.dbz_floor, torch.zeros((), dtype=rate.dtype, device=rate.device), rate)
+    return torch.where(
+        dbz <= s.dbz_floor, torch.zeros((), dtype=rate.dtype, device=rate.device), rate
+    )
 
 
-def _normalize_numpy(values: np.ndarray, standard_name: str, scaling: ReflectivityScaling) -> np.ndarray:
+def _normalize_numpy(
+    values: np.ndarray, standard_name: str, scaling: ReflectivityScaling
+) -> np.ndarray:
     """mlcast's forward normalisation, without its per-call ``rainfall_flux`` warning."""
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="Assuming we can use the same function")
@@ -318,7 +324,9 @@ def load_mlcast_model(
                 "checkpoints. Pass `network=` or `config_yaml=` (the run's Fiddle config.yaml)."
             ) from exc
     else:
-        model = NowcastLightningModule.load_from_checkpoint(checkpoint_path, network=network, **kwargs)
+        model = NowcastLightningModule.load_from_checkpoint(
+            checkpoint_path, network=network, **kwargs
+        )
     return model.to(device).eval()
 
 
@@ -373,7 +381,9 @@ def _spatial_dims(da: xr.DataArray, t_dim: str) -> tuple[str, str]:
 def _grid_spacing_km(coord: xr.DataArray) -> float:
     values = np.asarray(coord.values, dtype=float)
     if values.ndim != 1 or len(values) < 2:
-        raise ValueError(f"cannot infer the grid spacing from coordinate {coord.name!r}; pass dx_km")
+        raise ValueError(
+            f"cannot infer the grid spacing from coordinate {coord.name!r}; pass dx_km"
+        )
     spacing = float(np.median(np.abs(np.diff(values))))
     units = str(coord.attrs.get("units", "")).strip().lower()
     if units in ("km", "kilometre", "kilometer", "kilometres", "kilometers"):
@@ -534,7 +544,9 @@ class VerificationDataset(Dataset):
             raise KeyError(f"no data variable {variable!r} in the source dataset")
         standard_name = standard_name or ds[variable].attrs.get("standard_name")
         if standard_name is None:
-            raise ValueError(f"variable {variable!r} has no standard_name attribute; pass standard_name")
+            raise ValueError(
+                f"variable {variable!r} has no standard_name attribute; pass standard_name"
+            )
         _check_standard_name(standard_name)
         return variable, standard_name
 
@@ -553,7 +565,10 @@ class VerificationDataset(Dataset):
         )
         if len(np.unique(requested)) != len(requested):
             raise ValueError("init_times contains duplicates")
-        offsets = np.arange(-(self.input_steps - 1), self.forecast_steps + 1) * self.time_step.to_timedelta64()
+        offsets = (
+            np.arange(-(self.input_steps - 1), self.forecast_steps + 1)
+            * self.time_step.to_timedelta64()
+        )
         needed = requested[:, None] + offsets[None, :]
         indices = times.get_indexer(needed.ravel()).reshape(needed.shape)
         ok = (indices >= 0).all(axis=1)
@@ -623,7 +638,9 @@ class VerificationDataset(Dataset):
             "input": torch.from_numpy(np.ascontiguousarray(inputs[:, None], dtype=np.float32)),
             "target": torch.from_numpy(np.ascontiguousarray(target)),
             "mask": torch.from_numpy(mask),
-            "init_time": torch.tensor(self.init_times[idx].astype("datetime64[ns]").astype(np.int64)),
+            "init_time": torch.tensor(
+                self.init_times[idx].astype("datetime64[ns]").astype(np.int64)
+            ),
         }
 
 
@@ -644,7 +661,9 @@ def _member_chunks(ensemble_size: int, member_chunk: int | None) -> list[int]:
     if member_chunk is None or member_chunk >= ensemble_size:
         return [ensemble_size]
     if member_chunk < 2:
-        raise ValueError("member_chunk must be at least 2 for an ensemble (a 1-member call is deterministic)")
+        raise ValueError(
+            "member_chunk must be at least 2 for an ensemble (a 1-member call is deterministic)"
+        )
     chunks = [member_chunk] * (ensemble_size // member_chunk)
     rest = ensemble_size % member_chunk
     if rest == 1:
@@ -780,7 +799,11 @@ def verify_mlcast_model(
 
 def _describe_truth(dataset: VerificationDataset) -> str:
     attrs = dataset.ds.attrs
-    name = attrs.get("title") or attrs.get("mlcast_dataset_identifier") or str(dataset._path or "source data")
+    name = (
+        attrs.get("title")
+        or attrs.get("mlcast_dataset_identifier")
+        or str(dataset._path or "source data")
+    )
     ident = attrs.get("mlcast_dataset_identifier")
     version = attrs.get("mlcast_dataset_version")
     tag = f" ({ident} v{version})" if ident and version else ""

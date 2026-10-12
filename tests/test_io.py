@@ -48,9 +48,17 @@ def test_add_global_attrs_returns_copy():
     ds = make_synthetic_scores()
     ds_attrs = add_global_attrs(ds, **ATTRS)
     assert ds.attrs == {}
-    for key in ["title", "forecasts", "truth", "license", "mlcast_created_on",
-                "mlcast_created_by", "mlcast_created_with", "mlcast_dataset_version",
-                "mlcast_dataset_validator_version"]:
+    for key in [
+        "title",
+        "forecasts",
+        "truth",
+        "license",
+        "mlcast_created_on",
+        "mlcast_created_by",
+        "mlcast_created_with",
+        "mlcast_dataset_version",
+        "mlcast_dataset_validator_version",
+    ]:
         assert key in ds_attrs.attrs
     assert ds_attrs.attrs["license"] == "CC-BY-4.0"
 

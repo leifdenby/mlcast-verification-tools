@@ -13,12 +13,13 @@ import xarray as xr
 torch = pytest.importorskip("torch")
 pytest.importorskip("mlcast.data.normalization")
 
-from mlcast.data.normalization import DEFAULT_SCALING, ReflectivityScaling
-from mlcast.models.convgru import ConvGruModel
+# imported after the skips above, which need torch and mlcast
+from mlcast.data.normalization import DEFAULT_SCALING, ReflectivityScaling  # noqa: E402
+from mlcast.models.convgru import ConvGruModel  # noqa: E402
 
-from mlcast_verification_tools import conventions as cv
-from mlcast_verification_tools.integrations import mlcast as mi
-from mlcast_verification_tools.integrations._mlcast_core import _member_chunks
+from mlcast_verification_tools import conventions as cv  # noqa: E402
+from mlcast_verification_tools.integrations import mlcast as mi  # noqa: E402
+from mlcast_verification_tools.integrations._mlcast_core import _member_chunks  # noqa: E402
 
 
 def _lightning_module():
@@ -152,8 +153,12 @@ def test_mm_per_hour_factor_unknown():
 
 def test_init_times_from_range():
     expected = pd.date_range("2023-07-01", "2023-07-02", freq="6h").values
-    np.testing.assert_array_equal(mi.init_times_from_range("2023-07-01", "2023-07-02", "PT6H"), expected)
-    np.testing.assert_array_equal(mi.init_times_from_range("2023-07-01", "2023-07-02", "6h"), expected)
+    np.testing.assert_array_equal(
+        mi.init_times_from_range("2023-07-01", "2023-07-02", "PT6H"), expected
+    )
+    np.testing.assert_array_equal(
+        mi.init_times_from_range("2023-07-01", "2023-07-02", "6h"), expected
+    )
 
 
 # --- dataset ------------------------------------------------------------------------------------
@@ -172,7 +177,9 @@ def test_dataset_items_match_mlcast_preprocessing(source_path):
 
     item = ds[1]
     assert item["input"].shape == (INPUT_STEPS, 1, NY, NX) and item["input"].dtype == torch.float32
-    assert item["target"].shape == (FORECAST_STEPS, NY, NX) and item["target"].dtype == torch.float32
+    assert (
+        item["target"].shape == (FORECAST_STEPS, NY, NX) and item["target"].dtype == torch.float32
+    )
     assert item["mask"].shape == (NY, NX) and item["mask"].dtype == torch.bool
     assert np.datetime64(int(item["init_time"]), "ns") == init_times[1]
 
@@ -182,7 +189,8 @@ def test_dataset_items_match_mlcast_preprocessing(source_path):
     with pytest.warns(UserWarning):
         normed = DEFAULT_SCALING.normalization_registry["rainfall_flux"](frames)
     np.testing.assert_array_equal(
-        item["input"][:, 0].numpy(), np.nan_to_num(normed[:INPUT_STEPS], nan=-1.0).astype(np.float32)
+        item["input"][:, 0].numpy(),
+        np.nan_to_num(normed[:INPUT_STEPS], nan=-1.0).astype(np.float32),
     )
     # kg m-2 h-1 == mm/h, NaN kept
     np.testing.assert_array_equal(item["target"].numpy(), frames[INPUT_STEPS:])
@@ -203,12 +211,16 @@ def test_dataset_region_and_units_conversion(tmp_path):
     src = _source_dataset(units="kg m-2 s-1")
     src.to_zarr(path, zarr_format=2)
     region = {"y": slice(2, 18), "x": slice(4, 16)}
-    ds = mi.VerificationDataset(path, _valid_init_times(2), INPUT_STEPS, FORECAST_STEPS, region=region)
+    ds = mi.VerificationDataset(
+        path, _valid_init_times(2), INPUT_STEPS, FORECAST_STEPS, region=region
+    )
     item = ds[0]
     assert item["input"].shape == (INPUT_STEPS, 1, 16, 12)
     assert ds.to_mm_per_hour == 3600.0
     t_init = int(np.where(src.time.values == ds.init_times[0])[0][0])
-    expected = src.RR.values[t_init + 1 : t_init + 1 + FORECAST_STEPS, 2:18, 4:16] * np.float32(3600)
+    expected = src.RR.values[t_init + 1 : t_init + 1 + FORECAST_STEPS, 2:18, 4:16] * np.float32(
+        3600
+    )
     np.testing.assert_allclose(item["target"].numpy(), expected, rtol=1e-6)
 
 
@@ -240,7 +252,9 @@ def test_dataset_variable_lookup_errors():
     with pytest.raises(ValueError, match="found 0 data variables"):
         mi.VerificationDataset(src, _valid_init_times(1), INPUT_STEPS, FORECAST_STEPS)
     with pytest.raises(ValueError, match="not supported"):
-        mi.VerificationDataset(src, _valid_init_times(1), INPUT_STEPS, FORECAST_STEPS, variable="RR")
+        mi.VerificationDataset(
+            src, _valid_init_times(1), INPUT_STEPS, FORECAST_STEPS, variable="RR"
+        )
 
 
 # --- verification loop --------------------------------------------------------------------------
@@ -314,7 +328,9 @@ def test_verify_multichannel_model_rejected(source_path):
 
     ds = mi.VerificationDataset(source_path, _valid_init_times(1), INPUT_STEPS, FORECAST_STEPS)
     with pytest.raises(ValueError, match="single-variable"):
-        mi.verify_mlcast_model(TwoChannel(), ds, forecast_source="x", ensemble_size=2, progress=False)
+        mi.verify_mlcast_model(
+            TwoChannel(), ds, forecast_source="x", ensemble_size=2, progress=False
+        )
 
 
 # --- checkpoints and Fiddle configs -------------------------------------------------------------
@@ -372,7 +388,9 @@ def test_load_fiddle_yaml_type_tag():
 def test_load_mlcast_model(tmp_path):
     NowcastLightningModule = _lightning_module()
     torch.manual_seed(0)
-    module = NowcastLightningModule(network=ConvGruModel(num_blocks=2), ensemble_size=2, loss_class="mse")
+    module = NowcastLightningModule(
+        network=ConvGruModel(num_blocks=2), ensemble_size=2, loss_class="mse"
+    )
     run_dir = tmp_path / "version_0"
     (run_dir / "checkpoints").mkdir(parents=True)
     ckpt = run_dir / "checkpoints" / "epoch=0-step=1.ckpt"

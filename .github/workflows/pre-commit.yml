@@ -1,0 +1,27 @@
+### CI actions are pinned to immutable commit hashes, not mutable tags, to reduce supply-chain risk and help prevent LLM-based CI attacks. See https://github.com/lirantal/pypi-security-best-practices#13-secure-your-cicd-release-pipeline.
+name: linting
+
+on:
+  # Run on every pushed branch.
+  push:
+  # Run on every pull request update.
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linting:
+    name: "pre-commit hooks"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          enable-cache: true
+
+      # Run pre-commit through uv so CI uses the same project-managed environment
+      # as local development. pre-commit is in the `dev` dependency group, which
+      # `uv run` syncs by default; no torch extra is needed for linting.
+      - run: uv run pre-commit run --all-files --show-diff-on-failure

@@ -38,9 +38,13 @@ from mlcast_verification_tools.plots import plot_all
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     p.add_argument("--checkpoint", required=True)
-    p.add_argument("--config-yaml", help="the run's Fiddle config.yaml (default: found next to the checkpoint)")
+    p.add_argument(
+        "--config-yaml", help="the run's Fiddle config.yaml (default: found next to the checkpoint)"
+    )
     p.add_argument("--source", required=True, help="mlcast source-data Zarr (path or URL)")
     p.add_argument("--start", required=True)
     p.add_argument("--end", required=True)
@@ -52,7 +56,9 @@ def main() -> None:
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--forecast-source", default="mlcast-convgru")
     p.add_argument("--out", default="mlcast_scores.zarr")
-    p.add_argument("--other-scores", nargs="*", default=[], help="score files of other sources to merge")
+    p.add_argument(
+        "--other-scores", nargs="*", default=[], help="score files of other sources to merge"
+    )
     p.add_argument("--plots", help="directory for the figures")
     args = p.parse_args()
 
@@ -72,8 +78,9 @@ def main() -> None:
         forecast_steps=args.forecast_steps,
     )
     print(
-        f"{len(dataset)} cases, variable {dataset.variable!r} ({dataset.standard_name}, {dataset.units}), "
-        f"dx = {dataset.dx_km} km, lead times up to {dataset.lead_times[-1].astype('timedelta64[m]')}"
+        f"{len(dataset)} cases, variable {dataset.variable!r} "
+        f"({dataset.standard_name}, {dataset.units}), dx = {dataset.dx_km} km, "
+        f"lead times up to {dataset.lead_times[-1].astype('timedelta64[m]')}"
     )
 
     # 3. Forecast and score on the GPU, batch by batch; only scores are kept.

@@ -160,7 +160,10 @@ def ensemble_sizes(rank_hist: xr.DataArray) -> dict[str, int]:
     other = [d for d in rank_hist.dims if d not in (cv.FORECAST_SOURCE, cv.RANK)]
     has_value = rank_hist.notnull().any(other) if other else rank_hist.notnull()
     n_ranks = has_value.sum(cv.RANK)
-    return {str(s): int(n) - 1 for s, n in zip(n_ranks[cv.FORECAST_SOURCE].values, n_ranks.values)}
+    return {
+        str(s): int(n) - 1
+        for s, n in zip(n_ranks[cv.FORECAST_SOURCE].values, n_ranks.values, strict=False)
+    }
 
 
 def lead_time_colors(lead_times_min) -> list:

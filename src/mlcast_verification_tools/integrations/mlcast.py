@@ -116,7 +116,9 @@ def _parse_slice(text: str) -> slice:
         start, stop = text.split(":")
         return slice(int(start) if start else None, int(stop) if stop else None)
     except ValueError as exc:
-        raise argparse.ArgumentTypeError(f"expected an index range 'start:stop', got {text!r}") from exc
+        raise argparse.ArgumentTypeError(
+            f"expected an index range 'start:stop', got {text!r}"
+        ) from exc
 
 
 def add_run_mlcast_arguments(parser: argparse.ArgumentParser) -> None:
@@ -131,22 +133,33 @@ def add_run_mlcast_arguments(parser: argparse.ArgumentParser) -> None:
         Parser (sub-command) to add the arguments to.
     """
     g = parser.add_argument_group("model")
-    g.add_argument("--checkpoint", required=True, help="Lightning checkpoint (.ckpt) of the mlcast run")
+    g.add_argument(
+        "--checkpoint", required=True, help="Lightning checkpoint (.ckpt) of the mlcast run"
+    )
     g.add_argument(
         "--config-yaml",
-        help="the run's Fiddle config.yaml (default: config.yaml next to the checkpoint or one level up)",
+        help=(
+            "the run's Fiddle config.yaml "
+            "(default: config.yaml next to the checkpoint or one level up)"
+        ),
     )
     g.add_argument("--ensemble-size", type=int, default=20, help="number of members (default: 20)")
-    g.add_argument("--member-chunk", type=int, help="generate members in calls of at most this many (>= 2)")
+    g.add_argument(
+        "--member-chunk", type=int, help="generate members in calls of at most this many (>= 2)"
+    )
     g.add_argument("--device", help="torch device (default: cuda if available, else cpu)")
     g.add_argument("--seed", type=int, default=0)
 
     g = parser.add_argument_group("data")
     g.add_argument("--source", required=True, help="source-data Zarr store (path or URL)")
     g.add_argument(
-        "--storage-options", type=json.loads, help="JSON dict for xr.open_zarr, e.g. '{\"anon\": true}'"
+        "--storage-options",
+        type=json.loads,
+        help="JSON dict for xr.open_zarr, e.g. '{\"anon\": true}'",
     )
-    g.add_argument("--variable", help="data variable (default: the one with a rain-rate standard_name)")
+    g.add_argument(
+        "--variable", help="data variable (default: the one with a rain-rate standard_name)"
+    )
     g.add_argument("--standard-name", choices=SUPPORTED_STANDARD_NAMES)
     g.add_argument("--start", required=True, help="first init time (ISO 8601)")
     g.add_argument("--end", required=True, help="last init time (ISO 8601, inclusive)")

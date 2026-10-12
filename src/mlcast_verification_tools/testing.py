@@ -80,8 +80,10 @@ def make_synthetic_scores(
 
     # spectra: power law in wavelength; forecasts lose small-scale power with lead time
     base = wavelength ** (5 / 3)
-    psd_obs_case = base[None, None, :] * case_scale[..., None] * rng.lognormal(
-        0, 0.1, size=(1, n_i, n_l, len(k))
+    psd_obs_case = (
+        base[None, None, :]
+        * case_scale[..., None]
+        * rng.lognormal(0, 0.1, size=(1, n_i, n_l, len(k)))
     )
     psd_obs = np.broadcast_to(psd_obs_case, (n_s, n_i, n_l, len(k))).copy()
     cutoff_km = 2.0 + 30.0 * lt_frac[None, None, :, None] * source_skill[..., None]

@@ -1,17 +1,28 @@
 [build-system]
 build-backend = "hatchling.build"
-requires = [ "hatchling" ]
+requires = [ "hatch-vcs", "hatchling" ]
 
 [project]
 name = "mlcast-verification-tools"
-version = "0.1.0"
 description = "Verification scores and plots for precipitation nowcasts, stored in the MLCast forecast_scoring_metrics format"
 readme = "README.md"
+keywords = [ "nowcasting", "precipitation", "radar", "verification", "weather" ]
 license = { text = "Apache-2.0" }
 authors = [
   { name = "Leif Denby", email = "lcd@dmi.dk" },
 ]
 requires-python = ">=3.11"
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Atmospheric Science",
+]
+dynamic = [ "version" ]
 dependencies = [
   "matplotlib>=3.8",
   "netcdf4>=1.6",
@@ -21,31 +32,63 @@ dependencies = [
   "zarr>=3",
 ]
 
-optional-dependencies.compute = [
+# PyTorch (needed for computing scores) is installed through exactly one of the
+# `cpu`/`gpu-*` extras, which pick the matching PyTorch package index (see
+# `[tool.uv.sources]`), as in mlcast. torchvision is included because
+# `mlcast.visualization` imports it at module level.
+optional-dependencies.cpu = [
   "torch>=2.7.1",
+  "torchvision>=0.20",
 ]
+optional-dependencies.gpu-cu126 = [
+  "torch>=2.7.1",
+  "torchvision>=0.20",
+]
+optional-dependencies.gpu-cu128 = [
+  "torch>=2.7.1",
+  "torchvision>=0.20",
+]
+optional-dependencies.gpu-cu130 = [
+  "torch>=2.7.1",
+  "torchvision>=0.20",
+]
+# scoring trained mlcast models on the fly; combine with one of the torch extras
 optional-dependencies.mlcast = [
   "mlcast",
   "pytorch-lightning>=2",
-  "torch>=2.7.1",
-  # mlcast.visualization imports torchvision at module level, but mlcast only lists it
-  # in its own torch extras
-  "torchvision>=0.20",
 ]
+urls.Homepage = "https://github.com/leifdenby/mlcast-verification-tools"
+urls.Issues = "https://github.com/leifdenby/mlcast-verification-tools/issues"
+urls.Repository = "https://github.com/leifdenby/mlcast-verification-tools"
 scripts."mlcast.verify" = "mlcast_verification_tools.cli:main"
 
 [dependency-groups]
 dev = [
   "mlcast-dataset-validator",
+  "pre-commit>=3.5",
   "pytest>=8",
+  "pytest-cov>=4.1",
+  "ruff>=0.8",
 ]
 
-[tool.uv.sources]
-mlcast = { path = "../mlcast", editable = true }
-mlcast-dataset-validator = { git = "https://github.com/leifdenby/mlcast-dataset-validator", branch = "feat/verification-metrics-spec" }
+[tool.hatch.version]
+source = "vcs"
 
 [tool.hatch.build.targets.wheel]
 packages = [ "src/mlcast_verification_tools" ]
+
+[tool.ruff]
+line-length = 100
+format.indent-style = "space"
+format.quote-style = "double"
+lint.select = [
+  "B",  # flake8-bugbear
+  "E",  # pycodestyle errors
+  "F",  # pyflakes
+  "I",  # isort
+  "UP", # pyupgrade
+  "W",  # pycodestyle warnings
+]
 
 [tool.pytest.ini_options]
 testpaths = [ "tests" ]
@@ -53,5 +96,48 @@ markers = [
   "network: test needs network access (validator checks GitHub URLs)",
 ]
 
-[tool.ruff]
-line-length = 100
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv]
+conflicts = [
+  [
+    { extra = "cpu" },
+    { extra = "gpu-cu126" },
+    { extra = "gpu-cu128" },
+    { extra = "gpu-cu130" },
+  ],
+]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cpu", extra = "cpu" },
+  { index = "pytorch-cu126", extra = "gpu-cu126" },
+  { index = "pytorch-cu128", extra = "gpu-cu128" },
+  { index = "pytorch-cu130", extra = "gpu-cu130" },
+]
+torchvision = [
+  { index = "pytorch-cpu", extra = "cpu" },
+  { index = "pytorch-cu126", extra = "gpu-cu126" },
+  { index = "pytorch-cu128", extra = "gpu-cu128" },
+  { index = "pytorch-cu130", extra = "gpu-cu130" },
+]
+mlcast = { git = "https://github.com/mlcast-community/mlcast", branch = "main" }
+mlcast-dataset-validator = { git = "https://github.com/leifdenby/mlcast-dataset-validator", branch = "feat/verification-metrics-spec" }

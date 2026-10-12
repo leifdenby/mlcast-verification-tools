@@ -82,13 +82,17 @@ def _format_loglog(ax: Axes):
 
 def _plot_obs(ax: Axes, psd_obs: xr.DataArray):
     obs = psd_obs.mean([d for d in psd_obs.dims if d != cv.WAVELENGTH], skipna=True)
-    ax.plot(obs[cv.WAVELENGTH].values, obs.values, color=st.INK_PRIMARY,
-            linewidth=OBS_LINEWIDTH, label=OBS_LABEL, zorder=4)
+    ax.plot(
+        obs[cv.WAVELENGTH].values,
+        obs.values,
+        color=st.INK_PRIMARY,
+        linewidth=OBS_LINEWIDTH,
+        label=OBS_LABEL,
+        zorder=4,
+    )
 
 
-def _draw_psd_panels(
-    axes, ds: xr.Dataset, lead_times, variable: str, average_panel: bool = True
-):
+def _draw_psd_panels(axes, ds: xr.Dataset, lead_times, variable: str, average_panel: bool = True):
     """Draw per-source PSD panels (+ averaged panel) into `axes`; return the norm used."""
     psd = st.with_minutes(st.require(ds, cv.var_name(cv.PSD, variable)))
     psd_obs = st.with_minutes(st.require(ds, cv.var_name(cv.PSD_OBS, variable)))
@@ -99,7 +103,7 @@ def _draw_psd_panels(
     psd_mean = st.case_mean(psd)
     wl = psd[cv.WAVELENGTH].values
 
-    for ax, src in zip(axes, sources):
+    for ax, src in zip(axes, sources, strict=False):
         p = psd_mean.sel({cv.FORECAST_SOURCE: src})
         for lt in lts:
             y = p.sel({cv.LEAD_TIME: lt}).values
@@ -116,8 +120,14 @@ def _draw_psd_panels(
         ax = axes[len(sources)]
         for src in sources:
             y = psd.sel({cv.FORECAST_SOURCE: src}).mean([cv.INIT_TIME, cv.LEAD_TIME], skipna=True)
-            ax.plot(wl, y.values, color=st.source_color(ds, src),
-                    linestyle=st.source_linestyle(ds, src), label=src, zorder=3)
+            ax.plot(
+                wl,
+                y.values,
+                color=st.source_color(ds, src),
+                linestyle=st.source_linestyle(ds, src),
+                label=src,
+                zorder=3,
+            )
         _plot_obs(ax, psd_obs)
         _format_loglog(ax)
         ax.set_title("lead-time averaged", loc="left")
@@ -170,14 +180,21 @@ def plot_psd(ds: xr.Dataset, lead_times=None, variable: str = cv.VARIABLE) -> Fi
 
 def _draw_excess_panels(axes, ds: xr.Dataset, scales_km, variable: str):
     excess = st.with_minutes(excess_power_db(ds, scales_km, variable))
-    for ax, j in zip(axes, range(excess.sizes[cv.WAVELENGTH])):
+    for ax, j in zip(axes, range(excess.sizes[cv.WAVELENGTH]), strict=False):
         e = excess.isel({cv.WAVELENGTH: j})
         ax.axhline(0.0, color=st.INK_SECONDARY, linewidth=1.0, zorder=1)
         for src in st.source_names(ds):
             y = e.sel({cv.FORECAST_SOURCE: src})
-            ax.plot(y[cv.LEAD_TIME].values, y.values, color=st.source_color(ds, src),
-                    linestyle=st.source_linestyle(ds, src), marker="o", markersize=4,
-                    label=src, zorder=3)
+            ax.plot(
+                y[cv.LEAD_TIME].values,
+                y.values,
+                color=st.source_color(ds, src),
+                linestyle=st.source_linestyle(ds, src),
+                marker="o",
+                markersize=4,
+                label=src,
+                zorder=3,
+            )
         ax.set_title(f"λ ≈ {float(e[cv.WAVELENGTH]):.3g} km", loc="left")
         ax.set_xlabel("lead time [min]")
         ax.set_xlim(left=0)

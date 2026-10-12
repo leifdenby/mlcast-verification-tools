@@ -1,7 +1,7 @@
 """
 End-to-end demo on synthetic data: forecasts -> per-case scores -> spec file -> plots.
 
-    uv run --extra compute python examples/synthetic_demo.py --out demo_output
+    uv run --extra cpu python examples/synthetic_demo.py --out demo_output
 
 The "truth" is a stochastic rain field that advects and slowly decorrelates. Two
 synthetic ensemble forecasts are verified against it:
@@ -66,9 +66,7 @@ def _to_rain(latent: np.ndarray) -> np.ndarray:
 def _smooth(field: np.ndarray, length_px: float) -> np.ndarray:
     if length_px <= 0:
         return field
-    k2 = sum(
-        f**2 for f in np.meshgrid(np.fft.fftfreq(GRID), np.fft.fftfreq(GRID), indexing="ij")
-    )
+    k2 = sum(f**2 for f in np.meshgrid(np.fft.fftfreq(GRID), np.fft.fftfreq(GRID), indexing="ij"))
     gauss = np.exp(-2 * (np.pi * length_px) ** 2 * k2)
     return np.fft.ifft2(np.fft.fft2(field) * gauss).real
 

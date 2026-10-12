@@ -5,4 +5,9 @@ MLCast `verification/forecast_scoring_metrics` format, and all plots are made fr
 that stored format.
 """
 
-__version__ = "0.1.0"
+from importlib.metadata import PackageNotFoundError, version
+
+try:
+    __version__ = version("mlcast-verification-tools")
+except PackageNotFoundError:  # pragma: no cover - running from a source tree
+    __version__ = "unknown"

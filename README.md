@@ -53,11 +53,27 @@ part of the score file.
 
 ## Install
 
+PyTorch is installed through one of the `cpu`, `gpu-cu126`, `gpu-cu128` or
+`gpu-cu130` extras, as in mlcast:
+
 ```bash
-uv sync                    # reading, writing and plotting score files
-uv sync --extra compute    # + torch score kernels (offline scoring)
-uv sync --extra mlcast     # + on-the-fly scoring of trained mlcast models
+uv sync                                    # reading, writing and plotting score files
+uv sync --extra cpu                        # + torch score kernels on CPU (offline scoring)
+uv sync --extra gpu-cu128 --extra mlcast   # + on-the-fly GPU scoring of mlcast models
 ```
+
+## Development
+
+```bash
+uv sync --extra cpu --extra mlcast   # dev tools (pytest, pre-commit, ruff, validator) included
+uv run pre-commit install            # run ruff, pyproject-fmt etc. on every commit
+uv run pytest
+```
+
+CI runs the tests and the pre-commit hooks on every push and pull request. Pull
+requests must add an entry to `CHANGELOG.md` (or carry the `no changelog` label).
+Publishing a GitHub release uploads the package to PyPI via trusted publishing; the
+version comes from the git tag.
 
 ## Usage
 
@@ -91,7 +107,7 @@ mlcast.verify plot scores.zarr --out figures/
 Synthetic end-to-end demo (scoring → spec file → validation → figures):
 
 ```bash
-uv run --extra compute python examples/synthetic_demo.py --out demo_output
+uv run --extra cpu python examples/synthetic_demo.py --out demo_output
 ```
 
 ## Notes on the format

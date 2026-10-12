@@ -21,7 +21,9 @@ def _valid_rank_mask(rh: xr.DataArray) -> xr.DataArray:
         dims=cv.FORECAST_SOURCE,
         coords={cv.FORECAST_SOURCE: rh[cv.FORECAST_SOURCE]},
     )
-    position = xr.DataArray(np.arange(rh.sizes[cv.RANK]), dims=cv.RANK, coords={cv.RANK: rh[cv.RANK]})
+    position = xr.DataArray(
+        np.arange(rh.sizes[cv.RANK]), dims=cv.RANK, coords={cv.RANK: rh[cv.RANK]}
+    )
     return position < n_ranks
 
 
@@ -121,13 +123,21 @@ def _plot_source_panel(ax: Axes, ds: xr.Dataset, rh: xr.DataArray, src: str, lts
     ax.bar(ranks, full, width=0.8, color=st.FULL_FORECAST_GREY, label="full forecast", zorder=1)
     colors = st.lead_time_colors(lts_min) if len(lts_min) > 1 else [st.LEAD_TIME_CMAP(0.7)]
     all_lt = pbar[cv.LEAD_TIME].values
-    for lt, c in zip(lts_min, colors):
+    for lt, c in zip(lts_min, colors, strict=False):
         y = pbar.sel({cv.LEAD_TIME: all_lt[np.argmin(np.abs(all_lt - lt))]}).values[: k + 1]
         if np.all(np.isnan(y)):
             continue
-        ax.plot(ranks, y, color=c, marker="o", markersize=3.5, label=st.format_minutes(lt), zorder=3)
-    ax.axhline(1.0 / (k + 1), color=st.INK_SECONDARY, linestyle="--", linewidth=1.2, zorder=2,
-               label="uniform 1/(K+1)")
+        ax.plot(
+            ranks, y, color=c, marker="o", markersize=3.5, label=st.format_minutes(lt), zorder=3
+        )
+    ax.axhline(
+        1.0 / (k + 1),
+        color=st.INK_SECONDARY,
+        linestyle="--",
+        linewidth=1.2,
+        zorder=2,
+        label="uniform 1/(K+1)",
+    )
     ax.set_xlabel("rank")
     ax.set_xlim(ranks[0] - 0.6, ranks[-1] + 0.6)
     ax.set_xticks(ranks if len(ranks) <= 12 else ranks[:: int(np.ceil(len(ranks) / 12))])
@@ -177,7 +187,7 @@ def plot_rank_histograms(
     with st.style_context():
         fig, axes = st.new_figure(1, n_panels, figsize=(3.6 * n_panels + 0.4, 3.9), squeeze=False)
         axes = axes[0]
-        for ax, src in zip(axes, sources):
+        for ax, src in zip(axes, sources, strict=False):
             _plot_source_panel(ax, ds, rh, src, lts_min, sizes[src])
         axes[0].set_ylabel("rank frequency")
         # one shared legend for the lead-time / reference entries, below the panels so
