@@ -7,14 +7,12 @@ sub-command) does not import torch or mlcast. Import from the public module.
 from __future__ import annotations
 
 import argparse
-import functools
-import importlib
 import math
 import os
 import pathlib
 import warnings
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
 import pandas as pd
@@ -53,7 +51,6 @@ _UNITS_FACTORS = {
 # training-time path of a TensorBoard run is <log_dir>/checkpoints/<name>.ckpt with the
 # Fiddle config written to <log_dir>/config.yaml (mlcast.config.orchestrator)
 _CONFIG_YAML_NAME = "config.yaml"
-_NETWORK_CONFIG_PATH = "pl_module.network"
 
 
 # ---------------------------------------------------------------------------
@@ -151,139 +148,208 @@ def _normalize_numpy(
 
 
 # ---------------------------------------------------------------------------
-# Fiddle YAML configs and checkpoints
+# Run configs, test splits and checkpoints
 # ---------------------------------------------------------------------------
 
 
-def _resolve(module: str, qualname: str) -> Any:
-    obj = importlib.import_module(module)
-    for part in qualname.split("."):
-        obj = getattr(obj, part)
-    return obj
-
-
-def _yaml_loader():
-    import fiddle as fdl
-    import yaml
-
-    class FiddleYamlLoader(yaml.SafeLoader):
-        """SafeLoader that understands the tags written by Fiddle's ``dump_yaml``."""
-
-    def buildable(cls, loader, node):
-        kwargs = loader.construct_mapping(node, deep=True)
-        target = kwargs.pop("__fn_or_cls__", None)
-        if not isinstance(target, dict) or {"module", "name"} - set(target):
-            raise ValueError(f"{node.tag} node without a valid __fn_or_cls__ entry: {target!r}")
-        return cls(_resolve(target["module"], target["name"]), **kwargs)
-
-    def tagged_value(loader, node):
-        # tags are only used to select values when editing configs; keep the value
-        return loader.construct_mapping(node, deep=True)["value"]
-
-    def python_type(loader, node):
-        # mlcast.config.orchestrator registers `!type module.qualname` for classes
-        module, _, qualname = loader.construct_scalar(node).rpartition(".")
-        try:
-            return _resolve(module, qualname)
-        except (ImportError, AttributeError):
-            # qualname of a nested class: walk down from the longest importable module
-            parts = loader.construct_scalar(node).split(".")
-            for i in range(len(parts) - 1, 0, -1):
-                try:
-                    return _resolve(".".join(parts[:i]), ".".join(parts[i:]))
-                except (ImportError, AttributeError):
-                    continue
-            raise
-
-    FiddleYamlLoader.add_constructor("!fdl.Config", functools.partial(buildable, fdl.Config))
-    FiddleYamlLoader.add_constructor("!fdl.Partial", functools.partial(buildable, fdl.Partial))
-    FiddleYamlLoader.add_constructor("!fdl.TaggedValue", tagged_value)
-    FiddleYamlLoader.add_constructor("!type", python_type)
-    return FiddleYamlLoader
-
-
-def load_fiddle_yaml(path_or_text: str | os.PathLike) -> fdl.Config:
+def find_config_yaml(checkpoint: str | os.PathLike) -> pathlib.Path | None:
     """
-    Load a Fiddle config written by ``fiddle.experimental.yaml_serialization.dump_yaml``.
+    Find the Fiddle ``config.yaml`` of the mlcast run a checkpoint belongs to.
 
-    Supports the ``!fdl.Config``, ``!fdl.Partial`` and ``!fdl.TaggedValue`` tags
-    written by Fiddle 0.3 and the ``!type`` tag mlcast registers for classes.
-
-    .. warning:: Loading imports every module named in the YAML, so only load
-       configs you trust.
+    mlcast's TensorBoard layout is ``<run>/checkpoints/<name>.ckpt`` with the config
+    written to ``<run>/config.yaml``; a ``config.yaml`` next to the checkpoint is
+    also accepted.
 
     Parameters
     ----------
-    path_or_text : str or os.PathLike
-        Path to the YAML file, or the YAML text itself.
+    checkpoint : str or os.PathLike
+        Lightning ``.ckpt`` file.
 
     Returns
     -------
-    fdl.Config
-        The config graph (not built), e.g. ``fdl.build(cfg.pl_module.network)``.
+    pathlib.Path or None
+        The config file, or None if there is none in either place.
     """
-    import yaml
-
-    text = str(path_or_text)
-    if isinstance(path_or_text, os.PathLike) or ("\n" not in text and pathlib.Path(text).is_file()):
-        text = pathlib.Path(path_or_text).read_text()
-    return yaml.load(text, Loader=_yaml_loader())
-
-
-def build_network_from_config_yaml(
-    config_yaml: str | os.PathLike, key: str = _NETWORK_CONFIG_PATH
-) -> torch.nn.Module:
-    """
-    Build the network of an mlcast run from its Fiddle ``config.yaml``.
-
-    Parameters
-    ----------
-    config_yaml : str or os.PathLike
-        Path to the ``config.yaml`` mlcast wrote at the start of training (or its text).
-    key : str
-        Dotted path of the network config in the experiment config.
-
-    Returns
-    -------
-    torch.nn.Module
-        Freshly initialised network, ready for ``load_state_dict``.
-    """
-    import fiddle as fdl
-
-    cfg = load_fiddle_yaml(config_yaml)
-    sub = cfg
-    for part in key.split("."):
-        try:
-            sub = getattr(sub, part) if isinstance(sub, fdl.Buildable) else sub[part]
-        except (AttributeError, KeyError, TypeError) as exc:
-            raise KeyError(f"no {key!r} in the config (missing {part!r})") from exc
-    return fdl.build(sub)
-
-
-def _find_config_yaml(checkpoint_path: pathlib.Path) -> pathlib.Path | None:
-    for directory in (checkpoint_path.parent, checkpoint_path.parent.parent):
+    checkpoint = pathlib.Path(checkpoint)
+    for directory in (checkpoint.parent, checkpoint.parent.parent):
         candidate = directory / _CONFIG_YAML_NAME
         if candidate.is_file():
             return candidate
     return None
 
 
+def _is_url(path: str) -> bool:
+    return "://" in path
+
+
+def _resolve_path(path: str | os.PathLike, root: pathlib.Path) -> str:
+    """Resolve a relative local path against `root`; URLs and absolute paths are kept."""
+    text = os.fspath(path)
+    if _is_url(text) or pathlib.Path(text).is_absolute():
+        return text
+    return str((root / text).resolve())
+
+
+def _tuplify_splits(splits: Any) -> Any:
+    """``(start, end)`` split ranges come back from YAML as lists; mlcast wants tuples."""
+    if not isinstance(splits, dict):
+        return splits
+    return {
+        coord: (
+            {
+                name: tuple(value) if isinstance(value, list) else value
+                for name, value in coord_splits.items()
+            }
+            if isinstance(coord_splits, dict)
+            else coord_splits
+        )
+        for coord, coord_splits in splits.items()
+    }
+
+
+def load_run_config(
+    config_yaml: str | os.PathLike,
+    *,
+    data_root: str | os.PathLike | None = None,
+    zarr_path: str | os.PathLike | None = None,
+    index_path: str | os.PathLike | None = None,
+    storage_options: dict[str, Any] | None = None,
+) -> fdl.Config:
+    """
+    Load the Fiddle config of an mlcast training run, ready to rebuild its data and model.
+
+    Uses mlcast's ``mlcast.config.load_yaml_config``, then:
+
+    - turns ``(start, end)`` split ranges, which YAML stores as lists, back into the
+      tuples mlcast's split validation expects;
+    - applies the given overrides of the dataset factory's ``zarr_path``,
+      ``index_path`` and ``storage_options``;
+    - resolves relative ``zarr_path``/``index_path`` (mlcast's defaults are relative,
+      e.g. ``./data/radar.zarr``) against `data_root`.
+
+    .. warning:: Loading imports every module named in the YAML, so only load
+       configs you trust.
+
+    Parameters
+    ----------
+    config_yaml : str or os.PathLike
+        The run's ``config.yaml``, as written by mlcast at the start of training.
+    data_root : str or os.PathLike, optional
+        Directory that relative data paths are resolved against, typically the
+        directory training was started from. Default: the current directory.
+    zarr_path, index_path : str or os.PathLike, optional
+        Replace the source-data Zarr / sampling index of the config (e.g. when the
+        data has moved since training).
+    storage_options : dict, optional
+        Replace the ``storage_options`` used to open the Zarr.
+
+    Returns
+    -------
+    fdl.Config
+        The experiment config (not built), with ``pl_module``, ``data`` and ``trainer``.
+    """
+    from mlcast.config import load_yaml_config
+
+    cfg = load_yaml_config(config_yaml)
+    try:
+        data = cfg.data
+        factory = data.dataset_factory
+    except AttributeError as exc:
+        raise ValueError(
+            f"{config_yaml} is not an mlcast experiment config (no data.dataset_factory)"
+        ) from exc
+    data.splits = _tuplify_splits(data.splits)
+    if zarr_path is not None:
+        factory.zarr_path = os.fspath(zarr_path)
+    if index_path is not None:
+        factory.index_path = os.fspath(index_path)
+    if storage_options is not None:
+        factory.storage_options = storage_options
+    root = pathlib.Path(data_root) if data_root is not None else pathlib.Path.cwd()
+    for name in ("zarr_path", "index_path"):
+        value = getattr(factory, name, None)
+        if value is not None:
+            setattr(factory, name, _resolve_path(value, root))
+    return cfg
+
+
+def _as_run_config(config: fdl.Config | str | os.PathLike) -> fdl.Config:
+    if isinstance(config, str | os.PathLike):
+        return load_run_config(config)
+    return config
+
+
+def split_init_times(
+    config: fdl.Config | str | os.PathLike, split: str = "test"
+) -> pd.DatetimeIndex:
+    """
+    Init times of the crops mlcast's sampler selects for a split of a training run.
+
+    Builds the run's data module (only the Zarr metadata and the sampling index are
+    read), lets mlcast set up the split, and maps each selected crop to an init time.
+    A crop is the start ``t`` of a ``time_depth``-step window, from which mlcast
+    takes ``input_steps + forecast_steps`` frames at a random offset; here the offset
+    is 0, so the inputs are frames ``t .. t + input_steps - 1`` and the init time is
+    the time of frame ``t + input_steps - 1``. Crops at the same time but other
+    positions give the same init time; the verification forecasts the full domain.
+
+    Parameters
+    ----------
+    config : fdl.Config or str or os.PathLike
+        Run config from :func:`load_run_config`, or the path of its ``config.yaml``.
+    split : {"test", "val"}
+        Which split.
+
+    Returns
+    -------
+    pd.DatetimeIndex
+        Sorted, unique init times.
+    """
+    import fiddle as fdl
+
+    stages = {"test": "test", "val": "validate"}
+    if split not in stages:
+        raise ValueError(f"split must be one of {sorted(stages)}, got {split!r}")
+    config = _as_run_config(config)
+    dm = fdl.build(config.data)
+    dm.setup(stages[split])
+    dataset = getattr(dm, f"{split}_dataset", None)
+    if dataset is None:
+        raise ValueError(f"the run config defines no {split!r} split")
+    candidates = getattr(dataset, "candidates", None)
+    if candidates is None:
+        raise ValueError(
+            f"{type(dataset).__name__} has no sampling index (candidates); only "
+            "SourceDataIndexedDataset runs define a reproducible test split"
+        )
+    # mlcast rebases `t` onto the split's time slice; `_time_index_slice` is private
+    # (mlcast.data.source_data_datasets.SourceDataIndexedDataset), so its use is kept here
+    time_slice = getattr(dataset, "_time_index_slice", None)
+    offset = 0 if time_slice is None or time_slice.start is None else int(time_slice.start)
+    t_abs = candidates["t"].to_numpy(dtype=np.int64) + offset
+    t_init = np.unique(t_abs + int(dataset.input_steps) - 1)
+
+    ds = xr.open_zarr(dataset._zarr_path, storage_options=dataset.storage_options)
+    times = pd.DatetimeIndex(ds.indexes[dataset.t_dim])
+    if len(t_init) and t_init[-1] >= len(times):
+        raise ValueError("sampling index refers to times beyond the source Zarr")
+    return pd.DatetimeIndex(times[t_init]).unique().sort_values()
+
+
 def load_mlcast_model(
     checkpoint_path: str | os.PathLike,
     *,
     network: torch.nn.Module | None = None,
-    config_yaml: str | os.PathLike | None = None,
+    config: fdl.Config | str | os.PathLike | None = None,
     device: str | torch.device = "cpu",
 ) -> NowcastLightningModule:
     """
     Load a trained ``NowcastLightningModule`` from a Lightning checkpoint.
 
     The network architecture is not stored in the checkpoint, so it is taken from,
-    in order: `network`; the Fiddle config `config_yaml`; a ``config.yaml`` next to
-    the checkpoint or in its parent directory (mlcast's TensorBoard layout
-    ``<run>/checkpoints/*.ckpt`` + ``<run>/config.yaml``). If none is available,
-    mlcast's own ``from_checkpoint`` is tried (it fails for current mlcast
-    checkpoints, which do not store the network).
+    in order: `network`; ``pl_module.network`` of the run config `config`; a
+    ``config.yaml`` found by :func:`find_config_yaml`. If none is available,
+    loading fails with a ValueError.
 
     Parameters
     ----------
@@ -291,8 +357,8 @@ def load_mlcast_model(
         Lightning ``.ckpt`` file.
     network : torch.nn.Module, optional
         Network with the architecture used in training (weights are overwritten).
-    config_yaml : str or os.PathLike, optional
-        The run's Fiddle ``config.yaml``, used to rebuild the network.
+    config : fdl.Config or str or os.PathLike, optional
+        The run config (:func:`load_run_config`) or the path of its ``config.yaml``.
     device : str or torch.device
         Device to load the weights to.
 
@@ -301,14 +367,22 @@ def load_mlcast_model(
     NowcastLightningModule
         Model in eval mode on `device`.
     """
+    import fiddle as fdl
+    from mlcast.config import load_yaml_config
     from mlcast.nowcasting_module import NowcastLightningModule
 
     checkpoint_path = pathlib.Path(checkpoint_path)
     if network is None:
-        if config_yaml is None:
-            config_yaml = _find_config_yaml(checkpoint_path)
-        if config_yaml is not None:
-            network = build_network_from_config_yaml(config_yaml)
+        if config is None:
+            config = find_config_yaml(checkpoint_path)
+        if isinstance(config, str | os.PathLike):
+            config = load_yaml_config(config)
+        if config is not None:
+            try:
+                network_cfg = config.pl_module.network
+            except AttributeError as exc:
+                raise ValueError("no pl_module.network in the run config") from exc
+            network = fdl.build(network_cfg)
 
     kwargs: dict[str, Any] = {
         "map_location": torch.device(device),
@@ -321,7 +395,7 @@ def load_mlcast_model(
         except TypeError as exc:
             raise ValueError(
                 f"cannot restore {checkpoint_path}: the network is not stored in mlcast "
-                "checkpoints. Pass `network=` or `config_yaml=` (the run's Fiddle config.yaml)."
+                "checkpoints. Pass `network=` or `config=` (the run's Fiddle config.yaml)."
             ) from exc
     else:
         model = NowcastLightningModule.load_from_checkpoint(
@@ -522,6 +596,72 @@ class VerificationDataset(Dataset):
         if self._path is not None:
             # reopen lazily in each DataLoader worker (as mlcast does)
             self._ds = None
+
+    @classmethod
+    def from_mlcast_config(
+        cls,
+        config: fdl.Config | str | os.PathLike,
+        split: str = "test",
+        *,
+        forecast_steps: int | None = None,
+        max_cases: int | None = None,
+        region: dict[str, slice] | None = None,
+        **kwargs: Any,
+    ) -> VerificationDataset:
+        """
+        Cases of a training run's test (or validation) split, over the full domain.
+
+        The source Zarr, its ``storage_options``, the standard name (first of
+        ``standard_names``), ``input_steps`` and ``forecast_steps`` come from the
+        run's ``data.dataset_factory``; the init times are those of the crops mlcast
+        selects for the split (:func:`split_init_times`).
+
+        Parameters
+        ----------
+        config : fdl.Config or str or os.PathLike
+            Run config from :func:`load_run_config`, or the path of its ``config.yaml``
+            (relative data paths then resolve against the current directory).
+        split : {"test", "val"}
+            Which split.
+        forecast_steps : int, optional
+            Number of lead times; default the training value. A ConvGRU can be
+            unrolled further than it was trained for.
+        max_cases : int, optional
+            Keep at most this many init times, evenly spread over the split
+            (deterministic), for quick runs.
+        region : dict, optional
+            Fixed sub-domain, see the class parameters. Default: full domain.
+        **kwargs
+            Passed to the constructor (``on_missing``, ``to_mm_per_hour``, ...).
+
+        Returns
+        -------
+        VerificationDataset
+        """
+        config = _as_run_config(config)
+        factory = config.data.dataset_factory
+        standard_names = list(factory.standard_names)
+        if len(standard_names) != 1:
+            raise ValueError(
+                f"only single-variable runs are supported, the config has {standard_names}"
+            )
+        init_times = split_init_times(config, split)
+        if max_cases is not None:
+            if max_cases < 1:
+                raise ValueError("max_cases must be at least 1")
+            if max_cases < len(init_times):
+                pick = np.unique(np.linspace(0, len(init_times) - 1, max_cases).round().astype(int))
+                init_times = init_times[pick]
+        return cls(
+            factory.zarr_path,
+            init_times,
+            int(factory.input_steps),
+            int(forecast_steps if forecast_steps is not None else factory.forecast_steps),
+            standard_name=standard_names[0],
+            region=region,
+            storage_options=getattr(factory, "storage_options", None),
+            **kwargs,
+        )
 
     # -- setup helpers -------------------------------------------------------
 
@@ -733,7 +873,10 @@ def verify_mlcast_model(
     device : str or torch.device, optional
         Default ``"cuda"`` if available, else ``"cpu"``.
     num_workers : int
-        DataLoader workers reading the source data.
+        DataLoader workers reading the source data. Workers are spawned (not
+        forked), so `dataset` is pickled to each worker; a dataset opened from a
+        path is cheap to pickle (the store is reopened in the worker), an in-memory
+        ``xr.Dataset`` source is copied.
     seed : int
         Seeds torch's global RNG (the ConvGRU noise) and the rank-histogram tie breaking.
     compute_psd : bool
@@ -757,12 +900,18 @@ def verify_mlcast_model(
     acc = ScoreAccumulator(
         forecast_source, dataset.lead_times, dataset.dx_km, seed=seed, compute_psd=compute_psd
     )
+    worker_kwargs: dict[str, Any] = {}
+    if num_workers > 0:
+        # Forked workers can deadlock once the parent has started threads (zarr/xarray
+        # I/O, torch); spawned workers start clean and reopen the source themselves.
+        worker_kwargs = {"multiprocessing_context": "spawn", "persistent_workers": False}
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=device.type == "cuda",
+        **worker_kwargs,
     )
     batches = loader
     if progress:
@@ -831,42 +980,47 @@ def run_mlcast_from_args(args: argparse.Namespace) -> int:
     from ..io import write_scores
 
     region = {k: v for k, v in (("y", args.region_y), ("x", args.region_x)) if v is not None}
-    dataset = VerificationDataset(
-        args.source,
-        init_times_from_range(args.start, args.end, args.freq),
-        args.input_steps,
-        args.forecast_steps,
-        variable=args.variable,
+    run = _prepare_run(
+        args.checkpoint,
+        config_yaml=args.config_yaml,
+        split=args.split,
+        forecast_source=args.forecast_source,
+        device=args.device,
+        max_cases=args.max_cases,
+        forecast_steps=args.forecast_steps,
+        data_root=args.data_root,
+        zarr_path=args.zarr_path,
+        index_path=args.index_path,
+        storage_options=args.storage_options,
         region=region or None,
-        standard_name=args.standard_name,
-        time_step=args.time_step,
         on_missing=args.on_missing,
         to_mm_per_hour=args.to_mm_per_hour,
-        storage_options=args.storage_options,
     )
-    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    model = load_mlcast_model(args.checkpoint, config_yaml=args.config_yaml, device=device)
+    dataset = run.dataset
     scores = verify_mlcast_model(
-        model,
+        run.model,
         dataset,
-        forecast_source=args.forecast_source,
+        forecast_source=run.forecast_source,
         ensemble_size=args.ensemble_size,
         batch_size=args.batch_size,
-        device=device,
+        device=run.device,
         num_workers=args.num_workers,
         seed=args.seed,
         compute_psd=not args.no_psd,
         member_chunk=args.member_chunk,
         progress=not args.no_progress,
     )
+    first, last = (pd.Timestamp(t) for t in dataset.init_times[[0, -1]])
     forecasts = args.forecasts or (
-        f"{args.forecast_source}: mlcast model {pathlib.Path(args.checkpoint).name}, "
-        f"{args.ensemble_size}-member ensemble from {args.input_steps} input frames"
+        f"{run.forecast_source}: mlcast model {pathlib.Path(args.checkpoint).name}, "
+        f"{args.ensemble_size}-member ensemble from {dataset.input_steps} input frames, "
+        f"full domain at the {len(dataset)} init times of the {args.split} split's sampled "
+        f"crops ({first:%Y-%m-%dT%H:%M} to {last:%Y-%m-%dT%H:%M}) of {run.config_yaml}"
     )
     path = write_scores(
         scores,
         args.out,
-        title=args.title,
+        title=args.title or f"Verification scores of {run.forecast_source} ({args.split} split)",
         forecasts=forecasts,
         truth=args.truth or _describe_truth(dataset),
         created_by=args.created_by,
@@ -876,3 +1030,159 @@ def run_mlcast_from_args(args: argparse.Namespace) -> int:
     )
     print(f"wrote scores of {len(dataset)} cases to {path}")
     return 0
+
+
+class _Run(NamedTuple):
+    model: Any
+    dataset: VerificationDataset
+    forecast_source: str
+    device: str
+    config_yaml: pathlib.Path
+
+
+def _default_forecast_source(checkpoint: pathlib.Path) -> str:
+    """Name of the run directory (``<run>/checkpoints/<name>.ckpt`` -> ``<run>``)."""
+    parent = checkpoint.resolve().parent
+    run_dir = parent.parent if parent.name == "checkpoints" else parent
+    return run_dir.name or checkpoint.stem
+
+
+def _prepare_run(
+    checkpoint: str | os.PathLike,
+    *,
+    config_yaml: str | os.PathLike | None = None,
+    split: str = "test",
+    forecast_source: str | None = None,
+    device: str | torch.device | None = None,
+    max_cases: int | None = None,
+    forecast_steps: int | None = None,
+    data_root: str | os.PathLike | None = None,
+    zarr_path: str | os.PathLike | None = None,
+    index_path: str | os.PathLike | None = None,
+    storage_options: dict[str, Any] | None = None,
+    **dataset_kwargs: Any,
+) -> _Run:
+    checkpoint = pathlib.Path(checkpoint)
+    if config_yaml is None:
+        config_yaml = find_config_yaml(checkpoint)
+        if config_yaml is None:
+            raise FileNotFoundError(
+                f"no {_CONFIG_YAML_NAME} next to {checkpoint} or one directory up; "
+                "pass the run's config.yaml explicitly"
+            )
+    config = load_run_config(
+        config_yaml,
+        data_root=data_root,
+        zarr_path=zarr_path,
+        index_path=index_path,
+        storage_options=storage_options,
+    )
+    device = str(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    model = load_mlcast_model(checkpoint, config=config, device=device)
+    dataset = VerificationDataset.from_mlcast_config(
+        config, split, forecast_steps=forecast_steps, max_cases=max_cases, **dataset_kwargs
+    )
+    return _Run(
+        model,
+        dataset,
+        forecast_source or _default_forecast_source(checkpoint),
+        device,
+        pathlib.Path(config_yaml),
+    )
+
+
+def verify_mlcast_run(
+    checkpoint: str | os.PathLike,
+    *,
+    ensemble_size: int,
+    config_yaml: str | os.PathLike | None = None,
+    split: str = "test",
+    forecast_source: str | None = None,
+    device: str | torch.device | None = None,
+    batch_size: int = 1,
+    max_cases: int | None = None,
+    forecast_steps: int | None = None,
+    data_root: str | os.PathLike | None = None,
+    zarr_path: str | os.PathLike | None = None,
+    index_path: str | os.PathLike | None = None,
+    storage_options: dict[str, Any] | None = None,
+    region: dict[str, slice] | None = None,
+    num_workers: int = 0,
+    seed: int = 0,
+    compute_psd: bool = True,
+    member_chunk: int | None = None,
+    progress: bool = True,
+    **dataset_kwargs: Any,
+) -> xr.Dataset:
+    """
+    Score a trained mlcast run on the test split defined in its training config.
+
+    Finds and loads the run's ``config.yaml`` (:func:`load_run_config`), restores the
+    model from `checkpoint` (:func:`load_mlcast_model`), builds the cases
+    (:meth:`VerificationDataset.from_mlcast_config`: the unique init times of the
+    crops mlcast samples for the split, forecast over the full domain) and scores
+    them (:func:`verify_mlcast_model`).
+
+    Parameters
+    ----------
+    checkpoint : str or os.PathLike
+        Lightning ``.ckpt`` file of the run.
+    ensemble_size : int
+        Number of members.
+    config_yaml : str or os.PathLike, optional
+        The run's ``config.yaml``; default :func:`find_config_yaml`.
+    split : {"test", "val"}
+        Which split of the config to verify on.
+    forecast_source : str, optional
+        Name of the forecast source; default the run directory name.
+    device : str or torch.device, optional
+        Default ``"cuda"`` if available, else ``"cpu"``.
+    batch_size : int
+        Cases per batch.
+    max_cases : int, optional
+        Evenly subsample the init times to at most this many (quick runs).
+    forecast_steps : int, optional
+        Number of lead times; default the training value.
+    data_root, zarr_path, index_path, storage_options
+        Where to find the data, see :func:`load_run_config`.
+    region : dict, optional
+        Fixed sub-domain instead of the full domain, see :class:`VerificationDataset`.
+    num_workers, seed, compute_psd, member_chunk, progress
+        See :func:`verify_mlcast_model`.
+    **dataset_kwargs
+        Passed to :class:`VerificationDataset` (``on_missing``, ``to_mm_per_hour``, ...).
+
+    Returns
+    -------
+    xr.Dataset
+        Score dataset in the spec layout, without global attributes (add them with
+        ``write_scores``).
+    """
+    run = _prepare_run(
+        checkpoint,
+        config_yaml=config_yaml,
+        split=split,
+        forecast_source=forecast_source,
+        device=device,
+        max_cases=max_cases,
+        forecast_steps=forecast_steps,
+        data_root=data_root,
+        zarr_path=zarr_path,
+        index_path=index_path,
+        storage_options=storage_options,
+        region=region,
+        **dataset_kwargs,
+    )
+    return verify_mlcast_model(
+        run.model,
+        run.dataset,
+        forecast_source=run.forecast_source,
+        ensemble_size=ensemble_size,
+        batch_size=batch_size,
+        device=run.device,
+        num_workers=num_workers,
+        seed=seed,
+        compute_psd=compute_psd,
+        member_chunk=member_chunk,
+        progress=progress,
+    )

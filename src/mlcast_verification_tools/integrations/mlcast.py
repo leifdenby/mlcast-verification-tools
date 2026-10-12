@@ -6,18 +6,28 @@ so no forecast is ever written to disk. Only the per-case scores are kept.
 
 Needs the ``mlcast`` extra (torch, pytorch-lightning, mlcast). Importing this module
 is cheap: the CLI helpers below have no heavy dependencies, and the torch/mlcast
-API (:func:`denormalize_torch`, :func:`load_mlcast_model`,
+API (:func:`verify_mlcast_run`, :func:`load_mlcast_model`,
 :class:`VerificationDataset`, :func:`verify_mlcast_model`, ...) is imported on
 first access from :mod:`._mlcast_core`.
 
 Pipeline
 --------
-1. :func:`load_mlcast_model` restores a ``NowcastLightningModule`` from a Lightning
+:func:`verify_mlcast_run` (and ``mlcast.verify run-mlcast``) needs only the
+checkpoint of a training run; everything else comes from the run's Fiddle
+``config.yaml`` (``<run>/config.yaml`` next to ``<run>/checkpoints/*.ckpt``):
+
+1. :func:`load_run_config` loads the config with mlcast's own
+   ``mlcast.config.load_yaml_config`` and resolves its relative data paths.
+2. :func:`load_mlcast_model` restores a ``NowcastLightningModule`` from the
    checkpoint. The network is not part of the checkpoint's hyper-parameters (see
-   below), so it is rebuilt from the run's Fiddle ``config.yaml`` or passed in.
-2. :class:`VerificationDataset` reads full-domain (or fixed-region) cases from an
-   mlcast source-data Zarr, normalised exactly as mlcast's training datasets do.
-3. :func:`verify_mlcast_model` runs the model, clamps to the normalised range (as
+   below), so it is rebuilt from ``pl_module.network`` of the config.
+3. :func:`split_init_times` builds the run's data module and takes the unique init
+   times of the crops mlcast's sampler selects for the test (or validation) split;
+   :meth:`VerificationDataset.from_mlcast_config` reads full-domain cases at those
+   init times from the source Zarr, normalised exactly as mlcast's training
+   datasets do. The :class:`VerificationDataset` constructor also takes an explicit
+   source and init times (e.g. :func:`init_times_from_range`).
+4. :func:`verify_mlcast_model` runs the model, clamps to the normalised range (as
    ``NowcastLightningModule.shared_step`` does), de-normalises on the device with
    :func:`denormalize_torch` and accumulates the scores.
 
@@ -40,10 +50,7 @@ Checkpoints
 mlcast's ``NowcastLightningModule.from_checkpoint`` cannot restore a checkpoint
 on its own (``__init__`` is called without its required ``network`` argument).
 :func:`load_mlcast_model` passes the network explicitly to
-``load_from_checkpoint``. Fiddle (0.3) can dump its configs to YAML but not load
-them back, so :func:`load_fiddle_yaml` implements the inverse of
-``fiddle.experimental.yaml_serialization.dump_yaml`` (plus mlcast's ``!type``
-tag) and returns a ``fdl.Config`` graph.
+``load_from_checkpoint``.
 """
 
 from __future__ import annotations
@@ -55,14 +62,16 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:  # pragma: no cover - for type checkers/IDEs; imported lazily at runtime
     from ._mlcast_core import (  # re-exported lazily via __getattr__
         VerificationDataset,
-        build_network_from_config_yaml,
         denormalize_torch,
+        find_config_yaml,
         init_times_from_range,
-        load_fiddle_yaml,
         load_mlcast_model,
+        load_run_config,
         mm_per_hour_factor,
         run_mlcast_from_args,
+        split_init_times,
         verify_mlcast_model,
+        verify_mlcast_run,
     )
 
 #: CF standard names of rain-rate-like variables mlcast's Z-R scaling is applied to
@@ -71,28 +80,32 @@ SUPPORTED_STANDARD_NAMES = ("rainfall_rate", "rainfall_flux")
 
 _LAZY = (
     "VerificationDataset",
-    "build_network_from_config_yaml",
     "denormalize_torch",
+    "find_config_yaml",
     "init_times_from_range",
-    "load_fiddle_yaml",
     "load_mlcast_model",
+    "load_run_config",
     "mm_per_hour_factor",
     "run_mlcast_from_args",
+    "split_init_times",
     "verify_mlcast_model",
+    "verify_mlcast_run",
 )
 
 __all__ = [  # noqa: RUF022 - grouped: light helpers first, then the lazily imported API
     "SUPPORTED_STANDARD_NAMES",
     "add_run_mlcast_arguments",
     "VerificationDataset",
-    "build_network_from_config_yaml",
     "denormalize_torch",
+    "find_config_yaml",
     "init_times_from_range",
-    "load_fiddle_yaml",
     "load_mlcast_model",
+    "load_run_config",
     "mm_per_hour_factor",
     "run_mlcast_from_args",
+    "split_init_times",
     "verify_mlcast_model",
+    "verify_mlcast_run",
 ]
 
 
@@ -126,6 +139,10 @@ def add_run_mlcast_arguments(parser: argparse.ArgumentParser) -> None:
     Add the arguments of ``mlcast.verify run-mlcast`` to `parser`.
 
     Imports nothing beyond the standard library, so building the CLI stays cheap.
+    Only the checkpoint is needed to define the verification: the source data,
+    variable, input/forecast steps and the cases (the unique init times of the
+    crops mlcast samples for the test split, forecast over the full domain) come
+    from the run's ``config.yaml``.
 
     Parameters
     ----------
@@ -150,23 +167,33 @@ def add_run_mlcast_arguments(parser: argparse.ArgumentParser) -> None:
     g.add_argument("--device", help="torch device (default: cuda if available, else cpu)")
     g.add_argument("--seed", type=int, default=0)
 
-    g = parser.add_argument_group("data")
-    g.add_argument("--source", required=True, help="source-data Zarr store (path or URL)")
+    g = parser.add_argument_group("data (default: from the run config)")
+    g.add_argument(
+        "--split",
+        choices=("test", "val"),
+        default="test",
+        help="split of the run config to verify on (default: test)",
+    )
+    g.add_argument(
+        "--data-root",
+        help="directory relative data paths of the config are resolved against "
+        "(default: the current directory)",
+    )
+    g.add_argument("--zarr-path", help="source-data Zarr store (path or URL) to use instead")
+    g.add_argument("--index-path", help="sampling index (parquet) to use instead")
     g.add_argument(
         "--storage-options",
         type=json.loads,
         help="JSON dict for xr.open_zarr, e.g. '{\"anon\": true}'",
     )
     g.add_argument(
-        "--variable", help="data variable (default: the one with a rain-rate standard_name)"
+        "--forecast-steps",
+        type=int,
+        help="number of lead times (default: as in training)",
     )
-    g.add_argument("--standard-name", choices=SUPPORTED_STANDARD_NAMES)
-    g.add_argument("--start", required=True, help="first init time (ISO 8601)")
-    g.add_argument("--end", required=True, help="last init time (ISO 8601, inclusive)")
-    g.add_argument("--freq", required=True, help="init time spacing, e.g. PT6H or 6h")
-    g.add_argument("--input-steps", type=int, default=6)
-    g.add_argument("--forecast-steps", type=int, default=12)
-    g.add_argument("--time-step", help="frame spacing (default: most common spacing in the source)")
+    g.add_argument(
+        "--max-cases", type=int, help="evenly subsample the init times to at most this many"
+    )
     g.add_argument("--region-y", type=_parse_slice, help="y index range start:stop")
     g.add_argument("--region-x", type=_parse_slice, help="x index range start:stop")
     g.add_argument("--to-mm-per-hour", type=float, help="factor to mm/h (default: from units attr)")
@@ -175,11 +202,13 @@ def add_run_mlcast_arguments(parser: argparse.ArgumentParser) -> None:
     g.add_argument("--num-workers", type=int, default=0)
 
     g = parser.add_argument_group("output")
-    g.add_argument("--forecast-source", required=True, help="name of the forecast source")
+    g.add_argument(
+        "--forecast-source", help="name of the forecast source (default: the run directory name)"
+    )
     g.add_argument("--out", required=True, help="output score file (.nc) or Zarr store")
     g.add_argument("--no-psd", action="store_true", help="skip the radial power spectra")
     g.add_argument("--no-progress", action="store_true")
-    g.add_argument("--title", required=True)
+    g.add_argument("--title", help="title of the score dataset (default: generated)")
     g.add_argument("--created-by", required=True, help="'Name <email>'")
     g.add_argument(
         "--created-with",

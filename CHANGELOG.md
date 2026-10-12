@@ -18,5 +18,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   made from the score file only, and the `mlcast.verify plot` command.
 - On-the-fly GPU scoring of trained mlcast models without writing forecasts to disk
   (`verify_mlcast_model`, `mlcast.verify run-mlcast`).
+- Verification of an mlcast run from its checkpoint alone, on the test split of its
+  training config: `verify_mlcast_run`, `load_run_config`, `split_init_times`,
+  `find_config_yaml` and `VerificationDataset.from_mlcast_config`. The cases are the
+  unique init times of the crops mlcast samples for the split, forecast over the full
+  domain. `mlcast.verify run-mlcast` now takes `--checkpoint` (plus the output
+  attributes), with optional `--split`, `--data-root`, `--zarr-path`, `--index-path`,
+  `--max-cases` and `--forecast-steps`. It no longer takes `--source`, `--start`,
+  `--end`, `--freq`, `--input-steps`, `--variable`, `--standard-name` or `--time-step`.
+  The run config is loaded with mlcast's `load_yaml_config`, which replaces our own
+  Fiddle YAML loader (`load_fiddle_yaml` and `build_network_from_config_yaml` are
+  removed).
+- DataLoader workers of `verify_mlcast_model` are spawned instead of forked. Forked
+  workers could deadlock.
 - Development setup: pre-commit hooks (ruff, pyproject-fmt), and CI workflows for
   tests, linting, changelog checks and PyPI releases.

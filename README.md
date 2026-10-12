@@ -96,13 +96,37 @@ validate_scores(path).console_print()
 plot_all(scores, "figures/")
 ```
 
-Score a trained mlcast model on the GPU without writing forecasts to disk (see
-`examples/mlcast_gpu.py`), or from the command line:
+Score a trained mlcast run on the GPU without writing forecasts to disk. Only the
+checkpoint is needed. Everything else comes from the run's `config.yaml`, which mlcast
+writes next to `checkpoints/`: the network, the source Zarr, the variable, the
+input/forecast steps and the test split. Run it from the directory training was started
+from, because the config's data paths (e.g. `./data/radar.zarr`) are relative; otherwise
+pass `--data-root`, or `--zarr-path`/`--index-path`:
 
 ```bash
-mlcast.verify run-mlcast --help
+mlcast.verify run-mlcast \
+    --checkpoint logs/mlcast/version_3/checkpoints/best.ckpt \
+    --out scores.zarr \
+    --created-by "Name <email>" \
+    --created-with https://github.com/<org>/mlcast-dataset-<org>-<name>@v0.1.0
 mlcast.verify plot scores.zarr --out figures/
 ```
+
+The **cases are the unique init times of the crops mlcast's sampler selects for the test
+split** (`--split val` for the validation split). mlcast samples crops (256×256 pixels by default) from
+`time_depth`-step windows of a sampling index, using the config's `eval_selector` with a
+fixed seed, so the selection is reproducible. Each selected window start `t` gives the
+init time of frame `t + input_steps - 1`: the inputs are the first `input_steps` frames of
+the window. Several crops at the same time give one case. Each case is then forecast over
+the **full radar domain** (or a fixed `--region-y/--region-x`), because a score file
+holds one value per source, init time and lead time.
+
+`--max-cases N` evenly subsamples the init times for a quick run. `--forecast-steps`
+unrolls the model beyond its training horizon. From Python, use
+`verify_mlcast_run(checkpoint, ensemble_size=20)` (see `examples/mlcast_gpu.py`). To
+score arbitrary init times instead of the test split, build
+`VerificationDataset(source, init_times, input_steps, forecast_steps)` and pass it to
+`verify_mlcast_model`.
 
 Synthetic end-to-end demo (scoring → spec file → validation → figures):
 

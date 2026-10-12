@@ -36,15 +36,17 @@ NT, NY, NX = 40, 24, 20
 INPUT_STEPS, FORECAST_STEPS = 3, 4
 
 
-def _source_dataset(units: str = "kg m-2 h-1", missing_time_index: int | None = 30) -> xr.Dataset:
+def _source_dataset(
+    units: str = "kg m-2 h-1", missing_time_index: int | None = 30, nt: int = NT
+) -> xr.Dataset:
     """Tiny dataset in the layout of the mlcast source data (cf. IT-DPC-SRI v0.1.0)."""
     rng = np.random.default_rng(1)
-    rr = rng.gamma(0.5, 2.0, size=(NT, NY, NX)).astype(np.float32)
+    rr = rng.gamma(0.5, 2.0, size=(nt, NY, NX)).astype(np.float32)
     rr[rng.random(rr.shape) < 0.4] = 0.0
     rr[:, 0, 0] = np.nan  # never valid
     rr[10, 5, 5] = np.nan  # invalid in one frame only
-    time = T0 + STEP * np.arange(NT)
-    keep = np.ones(NT, bool)
+    time = T0 + STEP * np.arange(nt)
+    keep = np.ones(nt, bool)
     missing = np.array([], dtype="datetime64[ns]")
     if missing_time_index is not None:  # frame absent from the time axis, as in the real data
         keep[missing_time_index] = False
@@ -65,8 +67,8 @@ def _source_dataset(units: str = "kg m-2 h-1", missing_time_index: int | None = 
         },
         coords={
             "time": ("time", time[keep], {"standard_name": "time", "long_name": "Time"}),
-            "y": ("y", 649500.0 - 1000.0 * np.arange(NY), {"units": "m"}),
-            "x": ("x", -599500.0 + 1000.0 * np.arange(NX), {"units": "m"}),
+            "y": ("y", 649500.0 - 1000.0 * np.arange(NY), {"units": "m", "axis": "Y"}),
+            "x": ("x", -599500.0 + 1000.0 * np.arange(NX), {"units": "m", "axis": "X"}),
             "missing_times": ("missing_times", missing),
         },
         attrs={
@@ -303,7 +305,7 @@ def test_verify_smoke(source_path):
     xr.testing.assert_identical(scores, again)
 
 
-def test_verify_member_chunks_and_workers(source_path):
+def test_verify_member_chunks(source_path):
     ds = mi.VerificationDataset(source_path, _valid_init_times(3), INPUT_STEPS, FORECAST_STEPS)
     scores = mi.verify_mlcast_model(
         AdapterModel(),
@@ -312,12 +314,30 @@ def test_verify_member_chunks_and_workers(source_path):
         ensemble_size=5,
         member_chunk=2,
         batch_size=2,
-        num_workers=1,
+        num_workers=0,
         compute_psd=False,
         device="cpu",
         progress=False,
     )
     _check_scores(scores, 3, 5, psd=False)
+
+
+@pytest.mark.timeout(120)
+def test_verify_with_spawned_workers(source_path):
+    """The only test of the DataLoader worker path (workers are spawned, not forked)."""
+    ds = mi.VerificationDataset(source_path, _valid_init_times(2), INPUT_STEPS, FORECAST_STEPS)
+    kwargs = {
+        "forecast_source": "convgru",
+        "ensemble_size": 2,
+        "compute_psd": False,
+        "device": "cpu",
+        "progress": False,
+    }
+    with_workers = mi.verify_mlcast_model(AdapterModel(), ds, num_workers=1, **kwargs)
+    _check_scores(with_workers, 2, 2, psd=False)
+    xr.testing.assert_identical(
+        with_workers, mi.verify_mlcast_model(AdapterModel(), ds, num_workers=0, **kwargs)
+    )
 
 
 def test_verify_multichannel_model_rejected(source_path):
@@ -350,39 +370,217 @@ def _save_checkpoint(module, path) -> None:
     )
 
 
-def _tiny_experiment_yaml(num_blocks: int = 2) -> str:
+# a training run: source Zarr + sampling index under <root>/data, config with relative paths
+RUN_NT = 80  # frames of the run's source data (no gaps)
+TIME_DEPTH = 8  # sampled window, >= INPUT_STEPS + FORECAST_STEPS
+RATIO_SPLITS = {"time": {"train": 0.5, "val": 0.25, "test": 0.25}}  # test: frames 60..79
+
+
+def _write_sampling_index(path, zarr_path: str, times: np.ndarray) -> None:
+    """Sampling index of all (t, x, y) crop corners, written with mlcast's own schema."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from mlcast.data.source_data.sampling.sampling_index_spec import (
+        SamplingParameters,
+        build_schema,
+    )
+
+    t, x, y = np.meshgrid(np.arange(len(times) - TIME_DEPTH + 1), [0, 8], [0, 8], indexing="ij")
+    n = t.size
+    rng = np.random.default_rng(3)
+    mean = rng.random(n).astype(np.float32)
+    columns = {
+        "t": t.ravel().astype(np.int32),
+        "x": x.ravel().astype(np.int32),
+        "y": y.ravel().astype(np.int32),
+        "nan_count": np.zeros(n, np.int32),
+        "sum": mean * 512,
+        "mean": mean,
+        "frac_wet": rng.random(n).astype(np.float32),
+    }
+    params = SamplingParameters(
+        zarr_path=zarr_path,
+        data_var="RR",
+        time_var="time",
+        start_date=pd.Timestamp(times[0]).to_pydatetime(),
+        end_date=pd.Timestamp(times[-1]).to_pydatetime(),
+        time_step_minutes=5,
+        time_depth=TIME_DEPTH,
+        width=8,
+        height=8,
+        step_t=1,
+        step_x=8,
+        step_y=8,
+        max_nan=TIME_DEPTH * 64,
+        wet_threshold=0.1,
+        data_kind="rainrate",
+        units="kg m-2 h-1",
+    )
+    schema = build_schema(params)
+    pq.write_table(pa.Table.from_pydict(columns, schema=schema), path)
+
+
+def _experiment_config(splits=None, num_blocks: int = 2):
+    """mlcast's default experiment config, made tiny and pointed at ./data (relative)."""
     pytest.importorskip("fiddle")
     _lightning_module()
-    import mlcast.config.orchestrator  # noqa: F401  registers mlcast's `!type` representer
-    from fiddle.experimental.yaml_serialization import dump_yaml
     from mlcast.config.base import training_experiment
 
-    cfg = training_experiment.as_buildable()
+    cfg = training_experiment.as_buildable()  # calling it would build the experiment
+    factory = cfg.data.dataset_factory
+    factory.zarr_path = "./data/source.zarr"
+    factory.index_path = "./data/sampled_datacubes.parquet"
+    factory.input_steps = INPUT_STEPS
+    factory.forecast_steps = FORECAST_STEPS
+    factory.time_depth = TIME_DEPTH
+    factory.width = factory.height = 8
+    cfg.data.splits = splits or RATIO_SPLITS
+    cfg.data.eval_selector.keep_fraction = 0.5
+    cfg.data.num_workers = 0
     cfg.pl_module.network.num_blocks = num_blocks
-    return dump_yaml(cfg)
+    return cfg
 
 
-def test_load_fiddle_yaml_roundtrip():
+def _dump_config(cfg, path) -> None:
+    """Write the config as mlcast's orchestrator does at the start of training."""
+    import mlcast.config.orchestrator  # noqa: F401  registers mlcast's `!type` representer
+    from fiddle.experimental.yaml_serialization import dump_yaml
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(dump_yaml(cfg))
+
+
+@pytest.fixture
+def data_root(tmp_path):
+    """Directory training was started from: data/source.zarr + data/sampled_datacubes.parquet."""
+    root = tmp_path / "mlcast"
+    (root / "data").mkdir(parents=True)
+    src = _source_dataset(missing_time_index=None, nt=RUN_NT)
+    src.to_zarr(root / "data" / "source.zarr", zarr_format=2)
+    _write_sampling_index(
+        root / "data" / "sampled_datacubes.parquet", "./data/source.zarr", src.time.values
+    )
+    return root
+
+
+@pytest.fixture
+def run_dir(data_root):
+    """mlcast TensorBoard run: <run>/config.yaml + <run>/checkpoints/*.ckpt (tiny ConvGRU)."""
+    NowcastLightningModule = _lightning_module()
+    run = data_root / "logs" / "mlcast" / "version_0"
+    _dump_config(_experiment_config(), run / "config.yaml")
+    torch.manual_seed(0)
+    module = NowcastLightningModule(network=ConvGruModel(num_blocks=2), ensemble_size=2)
+    (run / "checkpoints").mkdir(parents=True)
+    _save_checkpoint(module, run / "checkpoints" / "epoch=0-step=1.ckpt")
+    return run
+
+
+def _test_dataset(cfg):
     import fiddle as fdl
 
-    text = _tiny_experiment_yaml(num_blocks=3)
-    cfg = mi.load_fiddle_yaml(text)
+    dm = fdl.build(cfg.data)
+    dm.setup("test")
+    return dm.test_dataset
+
+
+def test_load_run_config_resolves_paths(data_root, run_dir, tmp_path, monkeypatch):
+    import fiddle as fdl
+
+    cfg = mi.load_run_config(run_dir / "config.yaml", data_root=data_root)
     assert isinstance(cfg, fdl.Config)
-    assert cfg.pl_module.ensemble_size == 2
-    assert isinstance(cfg.pl_module.optimizer, fdl.Partial)
+    factory = cfg.data.dataset_factory
+    assert factory.zarr_path == str(data_root / "data" / "source.zarr")
+    assert factory.index_path == str(data_root / "data" / "sampled_datacubes.parquet")
     net = fdl.build(cfg.pl_module.network)
-    assert isinstance(net, ConvGruModel) and net.num_blocks == 3
-    net2 = mi.build_network_from_config_yaml(text)
-    assert {k: v.shape for k, v in net.state_dict().items()} == {
-        k: v.shape for k, v in net2.state_dict().items()
+    assert isinstance(net, ConvGruModel) and net.num_blocks == 2
+
+    # default root: the current directory
+    monkeypatch.chdir(data_root)
+    cfg = mi.load_run_config(run_dir / "config.yaml")
+    assert factory.zarr_path == cfg.data.dataset_factory.zarr_path
+
+    # overrides; URLs and absolute paths are kept as they are
+    cfg = mi.load_run_config(
+        run_dir / "config.yaml",
+        data_root=tmp_path,
+        zarr_path="s3://bucket/radar.zarr",
+        index_path="/abs/index.parquet",
+        storage_options={"anon": True},
+    )
+    factory = cfg.data.dataset_factory
+    assert factory.zarr_path == "s3://bucket/radar.zarr"
+    assert factory.index_path == "/abs/index.parquet"
+    assert factory.storage_options == {"anon": True}
+
+
+def test_find_config_yaml(run_dir, tmp_path):
+    ckpt = run_dir / "checkpoints" / "epoch=0-step=1.ckpt"
+    assert mi.find_config_yaml(ckpt) == run_dir / "config.yaml"
+    assert mi.find_config_yaml(tmp_path / "nowhere" / "x.ckpt") is None
+
+
+def test_split_init_times(data_root, run_dir):
+    cfg = mi.load_run_config(run_dir / "config.yaml", data_root=data_root)
+    init_times = mi.split_init_times(cfg)
+    assert isinstance(init_times, pd.DatetimeIndex)
+    assert init_times.is_monotonic_increasing and init_times.is_unique
+    assert len(init_times) > 3
+
+    # the crops mlcast selects for the test split (deterministic: seed 42)
+    dataset = _test_dataset(cfg)
+    t_abs = dataset.candidates["t"].to_numpy() + dataset._time_index_slice.start
+    times = xr.open_zarr(data_root / "data" / "source.zarr").time.values
+    expected = np.unique(times[t_abs + INPUT_STEPS - 1])
+    np.testing.assert_array_equal(init_times.values, expected)
+    assert len(expected) < len(dataset.candidates)  # several crops per time
+
+    # all input and target frames are in the test range (frames 60..79)
+    test_start, test_end = times[60], times[-1]
+    assert (init_times - (INPUT_STEPS - 1) * pd.Timedelta(STEP) >= test_start).all()
+    assert (init_times + FORECAST_STEPS * pd.Timedelta(STEP) <= test_end).all()
+
+    # the validation split ends before the test split
+    val_times = mi.split_init_times(cfg, "val")
+    assert val_times.max() < test_start
+    with pytest.raises(ValueError, match="split must be"):
+        mi.split_init_times(cfg, "train")
+
+
+def test_split_init_times_tuple_splits(data_root, tmp_path):
+    times = pd.DatetimeIndex(xr.open_zarr(data_root / "data" / "source.zarr").time.values)
+    iso = [str(t) for t in times]
+    splits = {
+        "time": {"train": (iso[0], iso[39]), "val": (iso[40], iso[59]), "test": (iso[60], iso[79])}
     }
-    with pytest.raises(KeyError, match="no 'pl_module.nope'"):
-        mi.build_network_from_config_yaml(text, key="pl_module.nope")
+    config_yaml = tmp_path / "tuple_run" / "config.yaml"
+    _dump_config(_experiment_config(splits=splits), config_yaml)
+    assert "- " in config_yaml.read_text()  # YAML stores the ranges as lists ...
+
+    cfg = mi.load_run_config(config_yaml, data_root=data_root)
+    assert cfg.data.splits["time"]["test"] == (iso[60], iso[79])  # ... coerced back to tuples
+    init_times = mi.split_init_times(cfg)
+    assert len(init_times) > 0
+    assert init_times.min() - (INPUT_STEPS - 1) * pd.Timedelta(STEP) >= times[60]
+    # same ranges as the ratio splits -> same cases
+    ratio_cfg = mi.load_run_config(config_yaml, data_root=data_root)
+    ratio_cfg.data.splits = RATIO_SPLITS
+    pd.testing.assert_index_equal(init_times, mi.split_init_times(ratio_cfg))
 
 
-def test_load_fiddle_yaml_type_tag():
-    loaded = mi.load_fiddle_yaml("a: !type torch.nn.modules.conv.Conv2d\n")
-    assert loaded["a"] is torch.nn.Conv2d
+def test_dataset_from_mlcast_config(data_root, run_dir):
+    cfg = mi.load_run_config(run_dir / "config.yaml", data_root=data_root)
+    all_times = mi.split_init_times(cfg)
+    ds = mi.VerificationDataset.from_mlcast_config(cfg)
+    np.testing.assert_array_equal(ds.init_times, all_times.values)
+    assert ds.input_steps == INPUT_STEPS and ds.forecast_steps == FORECAST_STEPS
+    assert ds.variable == "RR" and ds.standard_name == "rainfall_flux"
+    assert ds[0]["input"].shape == (INPUT_STEPS, 1, NY, NX)  # full domain, not the crop
+
+    few = mi.VerificationDataset.from_mlcast_config(cfg, max_cases=3, forecast_steps=2)
+    assert len(few) == 3 and few.forecast_steps == 2
+    np.testing.assert_array_equal(few.init_times[[0, -1]], all_times.values[[0, -1]])
+    assert set(few.init_times) <= set(all_times.values)
 
 
 def test_load_mlcast_model(tmp_path):
@@ -411,53 +609,92 @@ def test_load_mlcast_model(tmp_path):
     with pytest.raises(ValueError, match="network is not stored"):
         mi.load_mlcast_model(ckpt)
 
-    # explicit config.yaml, and auto-discovered <run>/config.yaml
+    # explicit config (path or loaded), and auto-discovered <run>/config.yaml
     config = tmp_path / "elsewhere.yaml"
-    config.write_text(_tiny_experiment_yaml(num_blocks=2))
-    assert_same_weights(mi.load_mlcast_model(ckpt, config_yaml=config))
+    _dump_config(_experiment_config(num_blocks=2), config)
+    assert_same_weights(mi.load_mlcast_model(ckpt, config=config))
+    assert_same_weights(mi.load_mlcast_model(ckpt, config=mi.load_run_config(config)))
     (run_dir / "config.yaml").write_text(config.read_text())
     assert_same_weights(mi.load_mlcast_model(ckpt))
 
 
-def test_run_mlcast_cli(tmp_path, source_path):
-    NowcastLightningModule = _lightning_module()
+CREATED_WITH = "https://github.com/mlcast-community/mlcast-dataset-xx-test-scores@v0.1.0"
+
+
+@pytest.fixture
+def offline_metadata(monkeypatch):
+    """Skip the validator's GitHub lookups of `mlcast_created_with` (as in test_io)."""
+    mlcast_metadata = pytest.importorskip(
+        "mlcast_dataset_validator.checks.global_attributes.mlcast_metadata"
+    )
+    monkeypatch.setattr(mlcast_metadata, "github_repo_exists", lambda *a: True)
+    monkeypatch.setattr(mlcast_metadata, "github_ref_exists", lambda *a: "tags/v0.1.0")
+
+
+def test_verify_mlcast_run(data_root, run_dir, tmp_path, offline_metadata):
+    from mlcast_verification_tools.io import validate_scores, write_scores
+
+    ckpt = run_dir / "checkpoints" / "epoch=0-step=1.ckpt"
+    scores = mi.verify_mlcast_run(
+        ckpt,
+        ensemble_size=3,
+        data_root=data_root,
+        device="cpu",
+        max_cases=3,
+        batch_size=2,
+        progress=False,
+    )
+    _check_scores(scores, 3, 3)
+    assert scores[cv.FORECAST_SOURCE].values.tolist() == ["version_0"]  # run directory name
+    cfg = mi.load_run_config(run_dir / "config.yaml", data_root=data_root)
+    assert set(scores[cv.INIT_TIME].values) <= set(mi.split_init_times(cfg).values)
+
+    path = write_scores(
+        scores,
+        tmp_path / "scores.zarr",
+        title="test scores",
+        forecasts="tiny ConvGRU",
+        truth="synthetic radar",
+        created_by="Test <test@example.com>",
+        created_with=CREATED_WITH,
+    )
+    report = validate_scores(path)
+    assert not report.has_fails(), [r for r in report.results if r.status == "FAIL"]
+
+    with pytest.raises(FileNotFoundError, match="config.yaml"):
+        mi.verify_mlcast_run(tmp_path / "model.ckpt", ensemble_size=2)
+
+
+def test_run_mlcast_cli(data_root, run_dir, monkeypatch):
+    from mlcast_verification_tools.cli import main
     from mlcast_verification_tools.io import open_scores
 
-    torch.manual_seed(0)
-    module = NowcastLightningModule(network=ConvGruModel(num_blocks=2), ensemble_size=2)
-    ckpt = tmp_path / "model.ckpt"
-    _save_checkpoint(module, ckpt)
-    (tmp_path / "config.yaml").write_text(_tiny_experiment_yaml(num_blocks=2))
-
-    parser = argparse.ArgumentParser()
-    mi.add_run_mlcast_arguments(parser)
-    out = tmp_path / "scores.nc"
-    args = parser.parse_args(
-        [
-            "--checkpoint", str(ckpt),
-            "--source", str(source_path),
-            "--start", str(_valid_init_times(4)[0]),
-            "--end", str(_valid_init_times(4)[-1]),
-            "--freq", "PT15M",
-            "--input-steps", str(INPUT_STEPS),
-            "--forecast-steps", str(FORECAST_STEPS),
-            "--ensemble-size", "3",
-            "--forecast-source", "convgru-test",
-            "--device", "cpu",
-            "--batch-size", "2",
-            "--region-y", "0:16",
-            "--region-x", "4:",
-            "--no-progress",
-            "--out", str(out),
-            "--title", "test scores",
-            "--created-by", "Test <test@example.com>",
-            "--created-with", "https://github.com/mlcast-community/mlcast-dataset-xx-test-scores@v0.1.0",
-        ]
-    )  # fmt: skip
-    assert mi.run_mlcast_from_args(args) == 0
+    monkeypatch.chdir(data_root)  # the config's data paths are relative to it
+    out = data_root / "scores.nc"
+    argv = [
+        "run-mlcast",
+        "--checkpoint", str(run_dir / "checkpoints" / "epoch=0-step=1.ckpt"),
+        "--out", str(out),
+        "--created-by", "Test <test@example.com>",
+        "--created-with", CREATED_WITH,
+        "--ensemble-size", "3",
+        "--max-cases", "4",
+        "--device", "cpu",
+        "--batch-size", "2",
+        "--region-y", "0:16",
+        "--region-x", "4:",
+        "--no-progress",
+    ]  # fmt: skip
+    assert main(argv) == 0
     scores = open_scores(out).load()
     _check_scores(scores, 4, 3)
-    assert scores.attrs["title"] == "test scores"
+    assert "version_0" in scores.attrs["title"] and "test split" in scores.attrs["title"]
     assert "XX-TEST v0.1.0" in scores.attrs["truth"]
-    assert "convgru-test" in scores.attrs["forecasts"]
+    assert "init times of the test split" in scores.attrs["forecasts"]
     assert scores.attrs["mlcast_created_with"].endswith("@v0.1.0")
+
+    # the arguments the config provides are gone
+    parser = argparse.ArgumentParser()
+    mi.add_run_mlcast_arguments(parser)
+    with pytest.raises(SystemExit):
+        parser.parse_args([*argv[1:], "--source", "x.zarr"])
