@@ -125,14 +125,58 @@ def test_forecast_source_argument():
         compute_scores(ds_forecasts, ds_truth, forecast_source="mine", device="cpu")
 
 
-def test_unit_conversion():
+def test_native_units():
+    """Scores are in the units of the data; the rank threshold follows the units."""
     ds_forecasts, ds_truth = _synthetic(seed=3)
     expected = compute_scores(ds_forecasts, ds_truth, batch_size=3, device="cpu")
     per_second = {"units": "kg m-2 s-1"}
     fc_s = ds_forecasts.assign(tp=(ds_forecasts["tp"] / 3600).assign_attrs(per_second))
     truth_s = ds_truth.assign(tp=(ds_truth["tp"] / 3600).assign_attrs(per_second))
     got = compute_scores(fc_s, truth_s, batch_size=3, device="cpu")
-    xr.testing.assert_allclose(got, expected, rtol=1e-4)
+    assert got["mae.tp"].attrs["units"] == "kg m-2 s-1"
+    assert got["psd.tp"].attrs["units"] == "kg2 m-4 s-2 km"
+    for name in ("mae.tp", "crps.tp"):
+        np.testing.assert_allclose(got[name], expected[name] / 3600, rtol=1e-4)
+    # 0.037 mm/h -> 0.037 / 3600 kg m-2 s-1: same ranks
+    xr.testing.assert_allclose(got["rank_histogram.tp"], expected["rank_histogram.tp"])
+    for name in ("psd.tp", "psd_obs.tp"):
+        np.testing.assert_allclose(got[name], expected[name] / 3600**2, rtol=1e-4)
+
+
+def test_mismatched_units_raise():
+    ds_forecasts, ds_truth = _synthetic()
+    ds_truth["tp"].attrs["units"] = "kg m-2 s-1"
+    with pytest.raises(ValueError, match="different units"):
+        compute_scores(ds_forecasts, ds_truth, device="cpu")
+    ds_truth["tp"].attrs["units"] = "mm  H-1"  # case and whitespace are ignored
+    compute_scores(ds_forecasts, ds_truth, device="cpu")
+
+
+def test_reflectivity_in_dbz():
+    """Any variable name and units: scores named after the variable, in its units."""
+    ds_forecasts, ds_truth = _synthetic(seed=4)
+    as_dbz = {"units": "dBZ"}
+    fc = ds_forecasts.rename(tp="dbz").assign(dbz=lambda d: (d.dbz * 10).assign_attrs(as_dbz))
+    truth = ds_truth.rename(tp="dbz").assign(dbz=lambda d: (d.dbz * 10).assign_attrs(as_dbz))
+    got = compute_scores(fc, truth, variable="dbz", device="cpu")
+    assert {"mae.dbz", "crps.dbz", "rank_histogram.dbz", "psd.dbz", "psd_obs.dbz"} == set(
+        got.data_vars
+    )
+    assert got["mae.dbz"].attrs["units"] == "dBZ" and got["psd.dbz"].attrs["units"] == "dBZ2 km"
+    with pytest.raises(ValueError, match="zero threshold"):
+        compute_scores(
+            fc.assign(dbz=fc.dbz.assign_attrs(units="K")),
+            truth.assign(dbz=truth.dbz.assign_attrs(units="K")),
+            variable="dbz",
+            device="cpu",
+        )
+    compute_scores(
+        fc.assign(dbz=fc.dbz.assign_attrs(units="K")),
+        truth.assign(dbz=truth.dbz.assign_attrs(units="K")),
+        variable="dbz",
+        zero_threshold=0.0,
+        device="cpu",
+    )
 
 
 def test_missing_units_raises():

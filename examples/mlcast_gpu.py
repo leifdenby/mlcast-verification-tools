@@ -101,7 +101,7 @@ def main() -> None:
         args.out,
         title=f"Verification scores of {source}",
         forecasts=f"{source}: {args.ensemble_size}-member mlcast ConvGRU ensemble, test split",
-        truth="mlcast source data of the run, converted to mm/h",
+        truth="mlcast source data of the run, in its own units",
     )
     print(f"wrote scores of {scores.sizes['init_time']} cases to {args.out}")
 

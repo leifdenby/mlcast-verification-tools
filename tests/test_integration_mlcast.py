@@ -79,6 +79,26 @@ def _source_dataset(
     return ds
 
 
+DBZ_NO_ECHO = -32.0  # "no echo" value of e.g. DMI's radar composite, below mlcast's 0 dBZ floor
+
+
+def _dbz_source_dataset(missing_time_index: int | None = 30, nt: int = NT) -> xr.Dataset:
+    """The rain rates of `_source_dataset` as a reflectivity variable in dBZ."""
+    src = _source_dataset(missing_time_index=missing_time_index, nt=nt)
+    rr = src.RR.values
+    with np.errstate(divide="ignore"):
+        dbz = (10 * np.log10(200.0) + 16 * np.log10(rr)).astype(np.float32)
+    dbz[rr == 0] = DBZ_NO_ECHO
+    dbz[rr > 8] = 70.0  # above mlcast's 60 dBZ ceiling
+    attrs = {
+        "grid_mapping": "crs",
+        "long_name": "10 min radar reflectivity",
+        "standard_name": "equivalent_reflectivity_factor",
+        "units": "dBZ",
+    }
+    return src.drop_vars("RR").assign(dbz=(("time", "y", "x"), dbz, attrs))
+
+
 @pytest.fixture
 def source_path(tmp_path):
     path = tmp_path / "source.zarr"
@@ -124,9 +144,24 @@ def test_denormalize_torch_matches_mlcast(standard_name, scaling):
     assert np.all(got[x <= -1.0] == 0)
 
 
+@pytest.mark.parametrize(
+    "scaling", [None, ReflectivityScaling(a=300.0, b=1.4, dbz_floor=5.0, dbz_ceiling=55.0)]
+)
+def test_denormalize_torch_reflectivity_matches_mlcast(scaling):
+    x = np.array([-1.0, -0.5, 0.0, 0.3, 1.0, np.nan], dtype=np.float32)
+    s = scaling or DEFAULT_SCALING
+    expected = s.denormalization_registry["equivalent_reflectivity_factor"](x.copy())
+    got = mi.denormalize_torch(
+        torch.from_numpy(x), "equivalent_reflectivity_factor", scaling
+    ).numpy()
+    np.testing.assert_allclose(got, expected, rtol=1e-6, equal_nan=True)
+    # dBZ, not a rain rate: the normalised range maps onto [dbz_floor, dbz_ceiling]
+    assert got[0] == pytest.approx(s.dbz_floor) and got[4] == pytest.approx(s.dbz_ceiling)
+
+
 def test_denormalize_torch_rejects_unsupported():
     with pytest.raises(ValueError, match="not supported"):
-        mi.denormalize_torch(torch.zeros(2), "equivalent_reflectivity_factor")
+        mi.denormalize_torch(torch.zeros(2), "rainfall_amount")
     with pytest.raises(TypeError):
         mi.denormalize_torch(torch.zeros(2, dtype=torch.int64))
 
@@ -207,7 +242,7 @@ def test_dataset_mask_covers_inputs(source_path):
     assert ds[0]["mask"][6, 6]
 
 
-def test_dataset_region_and_units_conversion(tmp_path):
+def test_dataset_region_and_native_units(tmp_path):
     path = tmp_path / "flux_si.zarr"
     src = _source_dataset(units="kg m-2 s-1")
     src.to_zarr(path, zarr_format=2)
@@ -217,12 +252,40 @@ def test_dataset_region_and_units_conversion(tmp_path):
     )
     item = ds[0]
     assert item["input"].shape == (INPUT_STEPS, 1, 16, 12)
-    assert ds.to_mm_per_hour == 3600.0
+    # native units: no conversion, the rank threshold is 0.037 mm/h in kg m-2 s-1
+    assert ds.units == "kg m-2 s-1" and ds.score_variable == "tp"
+    assert ds.zero_threshold == pytest.approx(0.037 / 3600)
     t_init = int(np.where(src.time.values == ds.init_times[0])[0][0])
-    expected = src.RR.values[t_init + 1 : t_init + 1 + FORECAST_STEPS, 2:18, 4:16] * np.float32(
-        3600
+    expected = src.RR.values[t_init + 1 : t_init + 1 + FORECAST_STEPS, 2:18, 4:16]
+    np.testing.assert_array_equal(item["target"].numpy(), expected)
+
+
+def test_dataset_reflectivity_source():
+    src = _dbz_source_dataset()
+    init_times = _valid_init_times(2)
+    ds = mi.VerificationDataset(src, init_times, INPUT_STEPS, FORECAST_STEPS)
+    assert ds.variable == "dbz" and ds.standard_name == "equivalent_reflectivity_factor"
+    assert ds.units == "dBZ" and ds.score_variable == "dbz"
+    assert ds.zero_threshold == DEFAULT_SCALING.dbz_floor
+
+    item = ds[1]
+    t_init = int(np.where(src.time.values == init_times[1])[0][0])
+    frames = src.dbz.values[t_init - INPUT_STEPS + 1 : t_init + FORECAST_STEPS + 1]
+    assert (frames == DBZ_NO_ECHO).any() and (frames > 60).any()
+    normed = DEFAULT_SCALING.normalization_registry["equivalent_reflectivity_factor"](frames)
+    np.testing.assert_array_equal(
+        item["input"][:, 0].numpy(),
+        np.nan_to_num(normed[:INPUT_STEPS], nan=-1.0).astype(np.float32),
     )
-    np.testing.assert_allclose(item["target"].numpy(), expected, rtol=1e-6)
+    # dBZ clipped to the range the model can predict, NaN kept
+    np.testing.assert_array_equal(item["target"].numpy(), np.clip(frames[INPUT_STEPS:], 0, 60))
+    assert np.isnan(item["target"][:, 0, 0]).all()
+
+    scaling = ReflectivityScaling(dbz_floor=5.0, dbz_ceiling=55.0)
+    ds = mi.VerificationDataset(src, init_times, INPUT_STEPS, FORECAST_STEPS, scaling=scaling)
+    target = ds[1]["target"].numpy()
+    assert ds.zero_threshold == 5.0
+    assert np.nanmin(target) == 5.0 and np.nanmax(target) == 55.0
 
 
 def test_dataset_missing_frames(source_path):
@@ -249,7 +312,7 @@ def test_dataset_missing_times_coordinate(tmp_path):
 
 def test_dataset_variable_lookup_errors():
     src = _source_dataset()
-    src["RR"].attrs["standard_name"] = "rainfall_amount"
+    src["RR"].attrs["standard_name"] = "rainfall_amount"  # not supported (accumulation)
     with pytest.raises(ValueError, match="found 0 data variables"):
         mi.VerificationDataset(src, _valid_init_times(1), INPUT_STEPS, FORECAST_STEPS)
     with pytest.raises(ValueError, match="not supported"):
@@ -271,14 +334,16 @@ def test_member_chunks():
         _member_chunks(4, 1)
 
 
-def _check_scores(scores: xr.Dataset, n_cases: int, n_members: int, psd: bool = True) -> None:
+def _check_scores(
+    scores: xr.Dataset, n_cases: int, n_members: int, psd: bool = True, variable: str = "tp"
+) -> None:
     assert dict(scores.sizes)[cv.FORECAST_SOURCE] == 1
     assert scores.sizes[cv.INIT_TIME] == n_cases
     assert scores.sizes[cv.LEAD_TIME] == FORECAST_STEPS
     assert scores.sizes[cv.RANK] == n_members + 1
-    names = {cv.var_name(m) for m in (cv.MAE, cv.CRPS, cv.RANK_HISTOGRAM)}
+    names = {cv.var_name(m, variable) for m in (cv.MAE, cv.CRPS, cv.RANK_HISTOGRAM)}
     if psd:
-        names |= {cv.var_name(cv.PSD), cv.var_name(cv.PSD_OBS)}
+        names |= {cv.var_name(cv.PSD, variable), cv.var_name(cv.PSD_OBS, variable)}
     assert names <= set(scores.data_vars)
     for name in names:
         assert np.isfinite(scores[name].values).all(), name
@@ -302,6 +367,24 @@ def test_verify_smoke(source_path):
     # same seed -> same ensemble -> same scores
     again = mi.verify_mlcast_model(AdapterModel(), ds, **kwargs)
     xr.testing.assert_identical(scores, again)
+
+
+def test_verify_reflectivity_source():
+    """A dBZ source is scored in dBZ, as `dbz`."""
+    ds = mi.VerificationDataset(
+        _dbz_source_dataset(), _valid_init_times(3), INPUT_STEPS, FORECAST_STEPS
+    )
+    scores = mi.verify_mlcast_model(
+        AdapterModel(), ds, forecast_source="convgru", ensemble_size=3, device="cpu",
+        progress=False,
+    )  # fmt: skip
+    _check_scores(scores, 3, 3, variable="dbz")
+    assert "mae.tp" not in scores
+    assert scores["mae.dbz"].attrs["units"] == "dBZ"
+    assert scores["crps.dbz"].attrs["units"] == "dBZ"
+    assert scores["psd.dbz"].attrs["units"] == "dBZ2 km"
+    # both forecast and (clipped) truth lie in [0, 60] dBZ
+    assert (scores["mae.dbz"].values <= 60).all()
 
 
 def test_verify_member_chunks(source_path):
@@ -375,7 +458,14 @@ TIME_DEPTH = 8  # sampled window, >= INPUT_STEPS + FORECAST_STEPS
 RATIO_SPLITS = {"time": {"train": 0.5, "val": 0.25, "test": 0.25}}  # test: frames 60..79
 
 
-def _write_sampling_index(path, zarr_path: str, times: np.ndarray) -> None:
+def _write_sampling_index(
+    path,
+    zarr_path: str,
+    times: np.ndarray,
+    data_var: str = "RR",
+    data_kind: str = "rainrate",
+    units: str = "kg m-2 h-1",
+) -> None:
     """Sampling index of all (t, x, y) crop corners, written with mlcast's own schema."""
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -399,7 +489,7 @@ def _write_sampling_index(path, zarr_path: str, times: np.ndarray) -> None:
     }
     params = SamplingParameters(
         zarr_path=zarr_path,
-        data_var="RR",
+        data_var=data_var,
         time_var="time",
         start_date=pd.Timestamp(times[0]).to_pydatetime(),
         end_date=pd.Timestamp(times[-1]).to_pydatetime(),
@@ -412,14 +502,14 @@ def _write_sampling_index(path, zarr_path: str, times: np.ndarray) -> None:
         step_y=8,
         max_nan=TIME_DEPTH * 64,
         wet_threshold=0.1,
-        data_kind="rainrate",
-        units="kg m-2 h-1",
+        data_kind=data_kind,
+        units=units,
     )
     schema = build_schema(params)
     pq.write_table(pa.Table.from_pydict(columns, schema=schema), path)
 
 
-def _experiment_config(splits=None, num_blocks: int = 2):
+def _experiment_config(splits=None, num_blocks: int = 2, standard_name: str | None = None):
     """mlcast's default experiment config, made tiny and pointed at ./data (relative)."""
     pytest.importorskip("fiddle")
     _lightning_module()
@@ -437,6 +527,8 @@ def _experiment_config(splits=None, num_blocks: int = 2):
     cfg.data.eval_selector.keep_fraction = 0.5
     cfg.data.num_workers = 0
     cfg.pl_module.network.num_blocks = num_blocks
+    if standard_name is not None:
+        factory.standard_names = [standard_name]
     return cfg
 
 
@@ -468,6 +560,39 @@ def run_dir(data_root):
     NowcastLightningModule = _lightning_module()
     run = data_root / "logs" / "mlcast" / "version_0"
     _dump_config(_experiment_config(), run / "config.yaml")
+    torch.manual_seed(0)
+    module = NowcastLightningModule(network=ConvGruModel(num_blocks=2), ensemble_size=2)
+    (run / "checkpoints").mkdir(parents=True)
+    _save_checkpoint(module, run / "checkpoints" / "epoch=0-step=1.ckpt")
+    return run
+
+
+@pytest.fixture
+def dbz_data_root(tmp_path):
+    """Like `data_root`, with a reflectivity (dBZ) source."""
+    root = tmp_path / "mlcast_dbz"
+    (root / "data").mkdir(parents=True)
+    src = _dbz_source_dataset(missing_time_index=None, nt=RUN_NT)
+    src.to_zarr(root / "data" / "source.zarr", zarr_format=2)
+    _write_sampling_index(
+        root / "data" / "sampled_datacubes.parquet",
+        "./data/source.zarr",
+        src.time.values,
+        data_var="dbz",
+        data_kind="reflectivity",
+        units="dBZ",
+    )
+    return root
+
+
+@pytest.fixture
+def dbz_run_dir(dbz_data_root):
+    """Like `run_dir`, for a model trained on the dBZ source."""
+    NowcastLightningModule = _lightning_module()
+    run = dbz_data_root / "logs" / "mlcast" / "version_0"
+    _dump_config(
+        _experiment_config(standard_name="equivalent_reflectivity_factor"), run / "config.yaml"
+    )
     torch.manual_seed(0)
     module = NowcastLightningModule(network=ConvGruModel(num_blocks=2), ensemble_size=2)
     (run / "checkpoints").mkdir(parents=True)
@@ -681,13 +806,21 @@ def _run_kwargs(data_root, **extra):
     return {**kwargs, **extra}
 
 
-def _check_forecasts(ds: xr.Dataset, n_cases: int, n_members: int, ny: int, nx: int) -> None:
-    assert list(ds.data_vars) == [cv.VARIABLE]
-    tp = ds[cv.VARIABLE]
+def _check_forecasts(
+    ds: xr.Dataset,
+    n_cases: int,
+    n_members: int,
+    ny: int,
+    nx: int,
+    variable: str = "tp",
+    units: str = "kg m-2 h-1",
+) -> None:
+    assert list(ds.data_vars) == [variable]
+    tp = ds[variable]
     assert tp.dims == cv.FORECAST_DIMS
     assert tp.shape == (1, n_cases, FORECAST_STEPS, n_members, ny, nx)
     assert tp.dtype == np.float32
-    assert tp.attrs["units"] == "mm h-1"
+    assert tp.attrs["units"] == units  # the source's units
     assert ds[cv.FORECAST_SOURCE].values.tolist() == ["version_0"]
     assert np.issubdtype(ds[cv.INIT_TIME].dtype, np.datetime64)
     assert np.issubdtype(ds[cv.LEAD_TIME].dtype, np.timedelta64)
@@ -726,10 +859,11 @@ def test_forecast_mlcast_in_memory_and_zarr(data_root, run_dir, tmp_path):
 def test_open_truth(data_root, run_dir):
     truth = mi.open_truth(run_dir / "config.yaml", data_root=data_root)
     tp = truth[cv.VARIABLE]
-    assert tp.dims == cv.TRUTH_DIMS and tp.attrs["units"] == "mm h-1"
+    assert tp.dims == cv.TRUTH_DIMS and tp.attrs["units"] == "kg m-2 h-1"
+    assert tp.attrs["standard_name"] == "rainfall_flux" and tp.attrs["source_variable"] == "RR"
     assert tp.chunks is not None  # lazy
     src = xr.open_zarr(data_root / "data" / "source.zarr")
-    np.testing.assert_array_equal(tp.values, src.RR.values)  # kg m-2 h-1 == mm/h
+    np.testing.assert_array_equal(tp.values, src.RR.values)  # native units
     np.testing.assert_array_equal(truth[cv.TIME].values, src.time.values)
     assert "XX-TEST v0.1.0" in truth.attrs["truth"]
 
@@ -747,9 +881,18 @@ def test_open_truth_units_and_missing_times(tmp_path, run_dir):
     truth = mi.open_truth(run_dir / "config.yaml", data_root=root)
     assert truth.sizes[cv.TIME] == RUN_NT - 1
     assert src.time.values[5] not in truth[cv.TIME].values
-    np.testing.assert_allclose(
-        truth[cv.VARIABLE].values[:5], src.RR.values[:5] * np.float32(3600), rtol=1e-6
-    )
+    assert truth[cv.VARIABLE].attrs["units"] == "kg m-2 s-1"  # not converted
+    np.testing.assert_array_equal(truth[cv.VARIABLE].values[:5], src.RR.values[:5])
+
+
+def test_open_truth_reflectivity(dbz_data_root, dbz_run_dir):
+    truth = mi.open_truth(dbz_run_dir / "config.yaml", data_root=dbz_data_root)
+    dbz = truth["dbz"]
+    assert list(truth.data_vars) == ["dbz"] and dbz.attrs["units"] == "dBZ"
+    assert dbz.attrs["standard_name"] == "equivalent_reflectivity_factor"
+    src = xr.open_zarr(dbz_data_root / "data" / "source.zarr")
+    np.testing.assert_array_equal(dbz.values, np.clip(src.dbz.values, 0, 60))
+    assert "clipped to [0, 60] dBZ" in truth.attrs["truth"]
 
 
 def _assert_scores_equal(got: xr.Dataset, expected: xr.Dataset) -> None:
@@ -779,6 +922,41 @@ def test_forecast_then_score_equals_verify(data_root, run_dir, region):
     )
     _check_scores(got, 3, 3)
     _assert_scores_equal(got, expected)
+
+
+def test_forecast_then_score_equals_verify_reflectivity(
+    dbz_data_root, dbz_run_dir, tmp_path, offline_metadata
+):
+    """A model trained on dBZ: forecasts, truth and scores in dBZ, both paths agree."""
+    from mlcast_verification_tools.io import validate_scores, write_scores
+    from mlcast_verification_tools.offline import compute_scores
+
+    config = mi.load_run_config(dbz_run_dir / "config.yaml", data_root=dbz_data_root)
+    ckpt = dbz_run_dir / "checkpoints" / "epoch=0-step=1.ckpt"
+    kwargs = _run_kwargs(None)
+
+    expected = mi.verify_mlcast_run(config, ckpt, **kwargs)
+    _check_scores(expected, 3, 3, variable="dbz")
+    assert expected["mae.dbz"].attrs["units"] == "dBZ"
+
+    ds_forecasts = mi.forecast_mlcast(config, ckpt, **kwargs)
+    _check_forecasts(ds_forecasts, 3, 3, NY, NX, variable="dbz", units="dBZ")
+    assert np.nanmax(ds_forecasts["dbz"].values) <= 60
+    got = compute_scores(
+        ds_forecasts,
+        mi.open_truth(config),
+        variable="dbz",
+        device="cpu",
+        batch_size=kwargs["batch_size"],
+        seed=kwargs["seed"],
+    )
+    _assert_scores_equal(got, expected)
+
+    path = write_scores(
+        expected, tmp_path / "scores.zarr", title="t", forecasts="f", truth="synthetic dBZ"
+    )
+    report = validate_scores(path)
+    assert not report.has_fails(), [r for r in report.results if r.status == "FAIL"]
 
 
 def test_config_object_not_modified(data_root, run_dir, tmp_path):

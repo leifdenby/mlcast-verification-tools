@@ -18,20 +18,22 @@ Input layouts
     - init times at which a source is all-NaN (e.g. padding after concatenating sources
       with different init times) are skipped for that source, so its scores there are
       NaN after merging;
-    - the variable (or the dataset) must have a ``units`` attribute convertible to mm/h
-      by :func:`.units.mm_per_hour_factor` (e.g. ``"mm h-1"``, ``"kg m-2 h-1"``,
-      ``"kg m-2 s-1"``, ``"mm/s"``).
+    - the variable (or the dataset) must have a ``units`` attribute, e.g. ``"mm h-1"``,
+      ``"kg m-2 s-1"`` or ``"dBZ"``.
 
 ``ds_truth``
     An ``xr.Dataset`` with the same data variable of dims ``(time, y, x)``
-    (:data:`.conventions.TRUTH_DIMS`) on the forecast grid, with a ``units`` attribute;
-    NaN marks invalid pixels. ``time`` must be unique; valid times
+    (:data:`.conventions.TRUTH_DIMS`) on the forecast grid, with the same ``units``
+    attribute as the forecasts; NaN marks invalid pixels. ``time`` must be unique; valid times
     ``init_time + lead_time`` missing from ``time`` are treated as all-NaN.
 
 Both datasets should keep their ``x``/``y`` projection coordinates (metres or km): the
 grid spacing ``dx_km`` is inferred from ``x`` (:func:`infer_dx_km`), and when both
 datasets have them the coordinates must agree. Data is loaded one batch of init times
 at a time, so dask- or Zarr-backed datasets work without loading everything.
+
+Scores are computed in the units of the data, without conversion, and named
+``{metric}.{variable}``.
 """
 
 from __future__ import annotations
@@ -42,7 +44,7 @@ import xarray as xr
 
 from . import conventions as cv
 from .accumulator import ScoreAccumulator, merge_sources
-from .units import mm_per_hour_factor
+from .units import default_zero_threshold
 
 
 def infer_dx_km(da: xr.DataArray | xr.Dataset) -> float:
@@ -67,8 +69,8 @@ def infer_dx_km(da: xr.DataArray | xr.Dataset) -> float:
     return dx / 1000.0 if dx > 100 else dx
 
 
-def _get_variable(ds: xr.Dataset, variable: str, what: str) -> tuple[xr.DataArray, float]:
-    """Data variable `variable` of `ds` and its factor to mm/h."""
+def _get_variable(ds: xr.Dataset, variable: str, what: str) -> tuple[xr.DataArray, str]:
+    """Data variable `variable` of `ds` and its units."""
     if not isinstance(ds, xr.Dataset):
         raise TypeError(f"{what} must be an xr.Dataset, got {type(ds).__name__}")
     if variable not in ds.data_vars:
@@ -77,7 +79,11 @@ def _get_variable(ds: xr.Dataset, variable: str, what: str) -> tuple[xr.DataArra
     units = da.attrs.get("units", ds.attrs.get("units"))
     if units is None:
         raise ValueError(f"{what}[{variable!r}] has no `units` attribute")
-    return da, mm_per_hour_factor(units)
+    return da, str(units)
+
+
+def _same_units(a: str, b: str) -> bool:
+    return a.strip().lower().replace(" ", "") == b.strip().lower().replace(" ", "")
 
 
 def _split_sources(fc: xr.DataArray, forecast_source: str | None) -> list[tuple[str, xr.DataArray]]:
@@ -119,6 +125,7 @@ def compute_scores(
     ds_truth: xr.Dataset,
     *,
     variable: str = cv.VARIABLE,
+    zero_threshold: float | None = None,
     forecast_source: str | None = None,
     dx_km: float | None = None,
     device: str | None = None,
@@ -136,11 +143,16 @@ def compute_scores(
         Forecasts, variable ``variable`` with dims
         ``([forecast_source,] init_time, lead_time, member, y, x)`` and a ``units`` attr.
     ds_truth : xr.Dataset
-        Truth, variable ``variable`` with dims ``(time, y, x)`` on the forecast grid and a
-        ``units`` attr; NaN = invalid. Each case is verified against the truth at valid
-        time ``init_time + lead_time`` (all-NaN if that time is missing).
+        Truth, variable ``variable`` with dims ``(time, y, x)`` on the forecast grid and
+        the same ``units`` attr as the forecasts; NaN = invalid. Each case is verified
+        against the truth at valid time ``init_time + lead_time`` (all-NaN if that time
+        is missing).
     variable : str
-        Name of the data variable in both datasets.
+        Name of the data variable in both datasets, also used in the score names
+        ``{metric}.{variable}``.
+    zero_threshold : float, optional
+        Value (in the data units) below which values count as zero in the rank
+        histogram. Default: :func:`.units.default_zero_threshold` of the units.
     forecast_source : str, optional
         Name of the source if ``ds_forecasts`` has no ``forecast_source`` dim; overrides
         a scalar ``forecast_source`` coordinate.
@@ -157,7 +169,8 @@ def compute_scores(
     Returns
     -------
     xr.Dataset
-        Scores of all sources in the spec layout (see :func:`.accumulator.merge_sources`).
+        Scores of all sources in the spec layout (see :func:`.accumulator.merge_sources`),
+        in the units of the data.
 
     Notes
     -----
@@ -166,8 +179,15 @@ def compute_scores(
     """
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
-    fc_all, fc_factor = _get_variable(ds_forecasts, variable, "ds_forecasts")
-    truth, truth_factor = _get_variable(ds_truth, variable, "ds_truth")
+    fc_all, units = _get_variable(ds_forecasts, variable, "ds_forecasts")
+    truth, truth_units = _get_variable(ds_truth, variable, "ds_truth")
+    if not _same_units(units, truth_units):
+        raise ValueError(
+            f"forecasts and truth have different units ({units!r}, {truth_units!r}); "
+            "scores are computed without unit conversion"
+        )
+    if zero_threshold is None:
+        zero_threshold = default_zero_threshold(units)
 
     if set(truth.dims) != set(cv.TRUTH_DIMS):
         raise ValueError(f"ds_truth[{variable!r}] must have dims {cv.TRUTH_DIMS}, got {truth.dims}")
@@ -187,26 +207,34 @@ def compute_scores(
         _check_grid(fc, truth)
         datasets.append(
             _score_source(
-                source, fc, fc_factor, truth, truth_factor, dx_km, device, batch_size, seed
+                fc,
+                truth,
+                ScoreAccumulator(
+                    source,
+                    fc[cv.LEAD_TIME].values,
+                    dx_km,
+                    variable=variable,
+                    units=units,
+                    zero_threshold=zero_threshold,
+                    seed=seed,
+                ),
+                device,
+                batch_size,
             )
         )
     return merge_sources(datasets)
 
 
 def _score_source(
-    source: str,
     fc: xr.DataArray,
-    fc_factor: float,
     truth: xr.DataArray,
-    truth_factor: float,
-    dx_km: float,
+    acc: ScoreAccumulator,
     device: str,
     batch_size: int,
-    seed: int,
 ) -> xr.Dataset:
     """Scores of one source, fc ``(init_time, lead_time, member, y, x)``."""
+    source = acc.forecast_source
     lead_times = fc[cv.LEAD_TIME].values
-    acc = ScoreAccumulator(source, lead_times, dx_km, seed=seed)
     members = None  # indices of the non-padding members, from the first batch with data
     for start in range(0, fc.sizes[cv.INIT_TIME], batch_size):
         batch = fc.isel({cv.INIT_TIME: slice(start, start + batch_size)})
@@ -227,12 +255,10 @@ def _score_source(
             )
         if len(members) < fc_np.shape[2]:
             fc_np = fc_np[:, :, members]
-        fc_np *= np.float32(fc_factor)
 
         valid_times = (init_times[:, None] + lead_times[None, :]).ravel()
         obs_np = np.asarray(truth.reindex({cv.TIME: valid_times}).values, dtype=np.float32)
         obs_np = obs_np.reshape(len(init_times), len(lead_times), *obs_np.shape[-2:])
-        obs_np *= np.float32(truth_factor)
         mask_np = np.isfinite(obs_np) & np.isfinite(fc_np).all(axis=2)
 
         acc.update(

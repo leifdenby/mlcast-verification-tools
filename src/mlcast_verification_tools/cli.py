@@ -80,18 +80,24 @@ def _cmd_score(args: argparse.Namespace) -> int:
             region={k: v for k, v in (("y", args.region_y), ("x", args.region_x)) if v is not None}
             or None,
         )
-        if args.variable != "tp":
-            ds_truth = ds_truth.rename({"tp": args.variable})
         truth_description = ds_truth.attrs["truth"]
 
     scores, descriptions = [], []
     for path in args.forecasts_paths:
         ds_forecasts = _open_dataset(path)
+        variable = args.variable
+        if variable is None:
+            if len(ds_forecasts.data_vars) != 1:
+                raise SystemExit(
+                    f"{path} has data variables {list(ds_forecasts.data_vars)}; pick one "
+                    "with --variable"
+                )
+            variable = str(next(iter(ds_forecasts.data_vars)))
         scores.append(
             compute_scores(
                 ds_forecasts,
                 ds_truth,
-                variable=args.variable,
+                variable=variable,
                 forecast_source=args.forecast_source,
                 dx_km=args.dx_km,
                 device=args.device,
@@ -127,9 +133,9 @@ def _add_score_subcommand(subparsers) -> None:
         description=(
             "Score forecast datasets (variable (forecast_source, init_time, lead_time, "
             "member, y, x) with a units attr, e.g. from forecast-trained-model) against a "
-            "truth dataset (variable (time, y, x) with a units attr) and write a score "
-            "dataset. Several forecast stores are scored separately and merged along "
-            "forecast_source."
+            "truth dataset (the same variable (time, y, x) in the same units) and write a "
+            "score dataset, in the units of the data. Several forecast stores are scored "
+            "separately and merged along forecast_source."
         ),
     )
     p.add_argument(
@@ -152,7 +158,11 @@ def _add_score_subcommand(subparsers) -> None:
     g.add_argument("--region-x", type=_parse_slice, help="x index range start:stop")
 
     g = p.add_argument_group("scoring")
-    g.add_argument("--variable", default="tp", help="data variable to score (default: tp)")
+    g.add_argument(
+        "--variable",
+        help="data variable to score, in forecasts and truth "
+        "(default: the single data variable of the forecasts)",
+    )
     g.add_argument(
         "--forecast-source",
         help="name of the source, for forecasts without a forecast_source dim/coordinate",

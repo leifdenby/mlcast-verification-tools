@@ -10,7 +10,7 @@ The training config of the run is always an explicit input (an ``fdl.Config`` fr
       scores = compute_scores(ds_forecasts, ds_truth)  # mlcast_verification_tools.offline
 
 - on the fly, never storing forecasts: forecasts are generated batch by batch on the
-  GPU (or CPU), converted to mm/h and passed straight to a
+  GPU (or CPU), de-normalised and passed straight to a
   :class:`~mlcast_verification_tools.accumulator.ScoreAccumulator`::
 
       scores = verify_mlcast_run(config, checkpoint, ensemble_size=20)
@@ -52,15 +52,22 @@ also available as ``mlcast.verify verify-trained-model`` / ``forecast-trained-mo
 
 Units
 -----
-mlcast applies its Marshall-Palmer Z-R scaling directly to the stored values,
-whatever ``standard_name`` they carry: ``rainfall_flux`` reuses the mm/h
-relation unchanged (mlcast warns about this). The model therefore predicts in the
-*units of the source variable*, and :func:`denormalize_torch` returns values in
-those units, like mlcast's ``DENORMALIZATION_REGISTRY``. Both forecasts and
-observations are then multiplied by a factor derived from the variable's
-``units`` attribute (:func:`mm_per_hour_factor`) to get mm/h: 1 for ``mm/h`` and
-``kg m-2 h-1`` (e.g. IT-DPC-SRI, ``rainfall_flux`` in ``kg m-2 h-1``), 3600 for
-``kg m-2 s-1`` / ``mm/s``.
+Forecasts and observations are scored in the *native units of the source variable*,
+without conversion; the scores are named after the variable's ``standard_name``
+(:data:`SUPPORTED_STANDARD_NAMES`, ``tp`` for rain rates, ``dbz`` for reflectivities)
+and carry its ``units``.
+
+- Rain rates (``rainfall_rate``, ``rainfall_flux``): mlcast applies its
+  Marshall-Palmer Z-R scaling directly to the stored values (``rainfall_flux`` reuses
+  the mm/h relation unchanged; mlcast warns about this), so the model predicts in the
+  units of the source variable and :func:`denormalize_torch` returns values in those
+  units, like mlcast's ``DENORMALIZATION_REGISTRY``. The rank-histogram zero threshold
+  is 0.037 mm/h expressed in those units (:func:`.units.default_zero_threshold`).
+- Reflectivities (``equivalent_reflectivity_factor``, dBZ): mlcast clips them to
+  ``[dbz_floor, dbz_ceiling]`` and maps that range linearly onto the normalised range;
+  :func:`denormalize_torch` maps back to dBZ. The observations are clipped to the
+  same range, since values outside it (e.g. a "no echo" value far below the floor)
+  cannot be predicted. The rank-histogram zero threshold is ``dbz_floor``.
 
 Checkpoints
 -----------
@@ -94,9 +101,9 @@ if TYPE_CHECKING:  # pragma: no cover - for type checkers/IDEs; imported lazily 
         verify_mlcast_run,
     )
 
-#: CF standard names of rain-rate-like variables mlcast's Z-R scaling is applied to
-#: and that can be scored as mm/h.
-SUPPORTED_STANDARD_NAMES = ("rainfall_rate", "rainfall_flux")
+#: CF standard names of the source variables that can be verified: rain rates, which
+#: mlcast normalises through its Z-R relation, and reflectivities in dBZ.
+SUPPORTED_STANDARD_NAMES = ("rainfall_rate", "rainfall_flux", "equivalent_reflectivity_factor")
 
 _LAZY = (
     "VerificationDataset",
@@ -214,7 +221,6 @@ def _add_run_arguments(parser: argparse.ArgumentParser, action: str) -> None:
     )
     g.add_argument("--region-y", type=_parse_slice, help="y index range start:stop")
     g.add_argument("--region-x", type=_parse_slice, help="x index range start:stop")
-    g.add_argument("--to-mm-per-hour", type=float, help="factor to mm/h (default: from units attr)")
     g.add_argument("--on-missing", choices=("skip", "raise"), default="skip")
     g.add_argument("--batch-size", type=int, default=1)
     g.add_argument("--num-workers", type=int, default=0)

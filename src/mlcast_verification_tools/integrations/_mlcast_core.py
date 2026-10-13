@@ -24,7 +24,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from .. import conventions as cv
 from ..accumulator import ScoreAccumulator
-from ..units import mm_per_hour_factor
+from ..units import default_zero_threshold, mm_per_hour_factor  # noqa: F401 - re-exported
 from .mlcast import SUPPORTED_STANDARD_NAMES
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -41,6 +41,15 @@ _CONFIG_YAML_NAME = "config.yaml"
 # ---------------------------------------------------------------------------
 
 
+_REFLECTIVITY = "equivalent_reflectivity_factor"
+
+_LONG_NAMES = {
+    "rainfall_rate": "rainfall rate",
+    "rainfall_flux": "rainfall flux",
+    _REFLECTIVITY: "equivalent reflectivity factor",
+}
+
+
 def _check_standard_name(standard_name: str) -> None:
     if standard_name not in SUPPORTED_STANDARD_NAMES:
         raise ValueError(
@@ -55,29 +64,32 @@ def denormalize_torch(
     scaling: ReflectivityScaling | None = None,
 ) -> torch.Tensor:
     """
-    Torch port of mlcast's inverse reflectivity scaling (normalised -> rain rate).
+    Torch port of mlcast's de-normalisation (normalised -> units of the source variable).
 
     Maps the normalised range ``[norm_min, norm_max]`` linearly onto
-    ``[dbz_floor, dbz_ceiling]`` dBZ, then applies the inverse Marshall-Palmer
-    relation ``R = 10 ** ((dBZ - 10 log10(a)) / (10 b))``; values at or below
-    ``dbz_floor`` become exactly 0 and NaN propagates, as in
-    ``ReflectivityScaling.normalized_to_rainfall_rate``. Runs on the device of `x`.
+    ``[dbz_floor, dbz_ceiling]`` dBZ, as ``ReflectivityScaling.denormalize_reflectivity``.
+    For reflectivities that is the result. For rain rates the inverse Marshall-Palmer
+    relation ``R = 10 ** ((dBZ - 10 log10(a)) / (10 b))`` follows; values at or below
+    ``dbz_floor`` become exactly 0, as in
+    ``ReflectivityScaling.normalized_to_rainfall_rate``. NaN propagates. Runs on the
+    device of `x`.
 
     Parameters
     ----------
     x : torch.Tensor
         Normalised values (floating point), any shape and device.
-    standard_name : {"rainfall_rate", "rainfall_flux"}
-        CF standard name of the variable the model was trained on. Both use the
-        same maths (mlcast reuses the mm/h relation for ``rainfall_flux``), so the
-        result is in the units of the source variable; see :func:`mm_per_hour_factor`.
+    standard_name : {"rainfall_rate", "rainfall_flux", "equivalent_reflectivity_factor"}
+        CF standard name of the variable the model was trained on. Both rain rates use
+        the same maths (mlcast reuses the mm/h relation for ``rainfall_flux``), so the
+        result is in the units of the source variable.
     scaling : mlcast.data.normalization.ReflectivityScaling, optional
         Scaling constants; defaults to mlcast's ``DEFAULT_SCALING``.
 
     Returns
     -------
     torch.Tensor
-        Rain rate in the units of the source variable, same shape/dtype/device as `x`.
+        Values in the units of the source variable (dBZ for reflectivities), same
+        shape/dtype/device as `x`.
     """
     _check_standard_name(standard_name)
     if not torch.is_floating_point(x):
@@ -86,10 +98,34 @@ def denormalize_torch(
     dbz = s.dbz_floor + (x - s.norm_min) * (
         (s.dbz_ceiling - s.dbz_floor) / (s.norm_max - s.norm_min)
     )
+    if standard_name == _REFLECTIVITY:
+        return dbz
     rate = torch.pow(10.0, (dbz - 10.0 * math.log10(s.a)) / (10.0 * s.b))
     return torch.where(
         dbz <= s.dbz_floor, torch.zeros((), dtype=rate.dtype, device=rate.device), rate
     )
+
+
+def _truth_values(values, standard_name: str, scaling: ReflectivityScaling):
+    """
+    Observed values as scored: reflectivities clipped to ``[dbz_floor, dbz_ceiling]``.
+
+    The model can only predict that range (mlcast clips its inputs to it too), so
+    values outside it, e.g. a "no echo" value far below the floor, are clipped. Rain
+    rates are returned unchanged. NaN is kept. Works on numpy, dask and xarray arrays.
+    """
+    if standard_name == _REFLECTIVITY:
+        return values.clip(scaling.dbz_floor, scaling.dbz_ceiling)
+    return values
+
+
+def _variable_attrs(standard_name: str, units: str) -> dict[str, str]:
+    """Attributes of a forecast/truth variable in the units of the source."""
+    return {
+        "units": units,
+        "long_name": _LONG_NAMES.get(standard_name, standard_name.replace("_", " ")),
+        "standard_name": standard_name,
+    }
 
 
 def _normalize_numpy(
@@ -494,6 +530,8 @@ class VerificationDataset(Dataset):
     Inputs are normalised exactly as in mlcast (``ReflectivityScaling`` forward
     conversion of the raw stored values, NaN -> ``norm_min``), and the validity
     mask is mlcast's: finite (after normalisation) at every input and target step.
+    Targets are in the native units of the source variable, reflectivities clipped to
+    ``[dbz_floor, dbz_ceiling]`` (the range the model can predict).
 
     Parameters
     ----------
@@ -521,9 +559,10 @@ class VerificationDataset(Dataset):
         are masked out.
     scaling : mlcast.data.normalization.ReflectivityScaling, optional
         Scaling constants, default mlcast's ``DEFAULT_SCALING``.
-    to_mm_per_hour : float, optional
-        Factor converting the source values to mm/h; default from the ``units``
-        attribute (:func:`mm_per_hour_factor`).
+    zero_threshold : float, optional
+        Value (in the source units) below which values count as zero in the rank
+        histogram. Default: ``scaling.dbz_floor`` for reflectivities, 0.037 mm/h in the
+        source units for rain rates (:func:`.units.default_zero_threshold`).
     dx_km : float, optional
         Grid spacing in km; default from the X coordinate spacing (metres -> km).
     storage_options : dict, optional
@@ -532,7 +571,7 @@ class VerificationDataset(Dataset):
     Notes
     -----
     Items are dicts with ``input`` (T_in, 1, H, W) float32 normalised, ``target``
-    (T_out, H, W) float32 in mm/h with NaN kept, ``mask`` (H, W) bool and
+    (T_out, H, W) float32 in the source units with NaN kept, ``mask`` (H, W) bool and
     ``init_time`` (int64 ns since the epoch, so it collates into a tensor).
     """
 
@@ -549,7 +588,7 @@ class VerificationDataset(Dataset):
         time_step=None,
         on_missing: str = "skip",
         scaling: ReflectivityScaling | None = None,
-        to_mm_per_hour: float | None = None,
+        zero_threshold: float | None = None,
         dx_km: float | None = None,
         storage_options: dict[str, Any] | None = None,
     ) -> None:
@@ -574,10 +613,18 @@ class VerificationDataset(Dataset):
         da = ds[self.variable]
         self.t_dim = self._time_dim(da)
         self.y_dim, self.x_dim = _spatial_dims(da, self.t_dim)
-        self.units = da.attrs.get("units")
-        self.to_mm_per_hour = (
-            float(to_mm_per_hour) if to_mm_per_hour is not None else mm_per_hour_factor(self.units)
-        )
+        units = da.attrs.get("units")
+        if units is None:
+            raise ValueError(f"variable {self.variable!r} has no `units` attribute")
+        self.units = str(units)
+        # scores are in the native units and named after the kind of variable (tp, dbz)
+        self.score_variable = cv.SHORT_NAMES[self.standard_name]
+        if zero_threshold is not None:
+            self.zero_threshold = float(zero_threshold)
+        elif self.standard_name == _REFLECTIVITY:
+            self.zero_threshold = float(self.scaling.dbz_floor)
+        else:
+            self.zero_threshold = default_zero_threshold(self.units)
 
         times = pd.DatetimeIndex(ds.indexes[self.t_dim])
         if time_step is None:
@@ -644,7 +691,7 @@ class VerificationDataset(Dataset):
         region : dict, optional
             Fixed sub-domain, see the class parameters. Default: full domain.
         **kwargs
-            Passed to the constructor (``on_missing``, ``to_mm_per_hour``, ...).
+            Passed to the constructor (``on_missing``, ``zero_threshold``, ...).
 
         Returns
         -------
@@ -800,7 +847,9 @@ class VerificationDataset(Dataset):
         normed = _normalize_numpy(raw, self.standard_name, self.scaling)
         mask = ~np.isnan(normed).any(axis=0)
         inputs = np.nan_to_num(normed[: self.input_steps], nan=self.scaling.norm_min)
-        target = raw[self.input_steps :].astype(np.float32) * np.float32(self.to_mm_per_hour)
+        target = _truth_values(
+            raw[self.input_steps :].astype(np.float32), self.standard_name, self.scaling
+        )
         return {
             "input": torch.from_numpy(np.ascontiguousarray(inputs[:, None], dtype=np.float32)),
             "target": torch.from_numpy(np.ascontiguousarray(target)),
@@ -880,8 +929,9 @@ def verify_mlcast_model(
     Score an mlcast model on the cases of `dataset` without storing forecasts.
 
     For each batch: ``model(x, forecast_steps=T, ensemble_size=K)`` -> clamp to
-    ``[norm_min, norm_max]`` (as in training) -> :func:`denormalize_torch` -> mm/h ->
-    :meth:`ScoreAccumulator.update` on the device; the forecast tensor is then freed.
+    ``[norm_min, norm_max]`` (as in training) -> :func:`denormalize_torch` (to the
+    source units) -> :meth:`ScoreAccumulator.update` on the device; the forecast tensor
+    is then freed. Scores are in the native units of the source variable.
 
     Parameters
     ----------
@@ -921,7 +971,14 @@ def verify_mlcast_model(
         Score dataset in the spec layout, without global attributes.
     """
     acc = ScoreAccumulator(
-        forecast_source, dataset.lead_times, dataset.dx_km, seed=seed, compute_psd=compute_psd
+        forecast_source,
+        dataset.lead_times,
+        dataset.dx_km,
+        variable=dataset.score_variable,
+        units=dataset.units,
+        zero_threshold=dataset.zero_threshold,
+        seed=seed,
+        compute_psd=compute_psd,
     )
     batches = _iter_forecasts(
         model,
@@ -965,9 +1022,9 @@ def _iter_forecasts(
     Yields
     ------
     fc : torch.Tensor
-        Forecast ``(B, T, M, H, W)`` in mm/h on the device.
+        Forecast ``(B, T, M, H, W)`` in the source units on the device.
     obs : torch.Tensor
-        Observation ``(B, T, H, W)`` in mm/h on the device, NaN replaced by 0 (NaN
+        Observation ``(B, T, H, W)`` in the source units on the device, NaN replaced by 0 (NaN
         pixels are outside `mask`).
     mask : torch.Tensor
         Boolean ``(B, H, W)`` on the device: finite at all input and target steps.
@@ -1012,8 +1069,6 @@ def _iter_forecasts(
             preds = _forecast(model, x, dataset.forecast_steps, chunks)
             preds = preds.clamp_(scaling.norm_min, scaling.norm_max)
             preds = denormalize_torch(preds, dataset.standard_name, scaling)
-            if dataset.to_mm_per_hour != 1.0:
-                preds.mul_(dataset.to_mm_per_hour)
             del x
         yield preds, obs, mask, init_times
         del preds, obs, mask
@@ -1025,7 +1080,12 @@ def _iter_forecasts(
 
 
 def _describe_source(
-    attrs: dict[str, Any], path: Any, variable: str, standard_name: str, units: Any
+    attrs: dict[str, Any],
+    path: Any,
+    variable: str,
+    standard_name: str,
+    units: Any,
+    scaling: ReflectivityScaling,
 ) -> str:
     name = (
         attrs.get("title") or attrs.get("mlcast_dataset_identifier") or str(path or "source data")
@@ -1033,12 +1093,20 @@ def _describe_source(
     ident = attrs.get("mlcast_dataset_identifier")
     version = attrs.get("mlcast_dataset_version")
     tag = f" ({ident} v{version})" if ident and version else ""
-    return f"{name}{tag}, variable {variable!r} ({standard_name}, {units}) converted to mm/h"
+    text = f"{name}{tag}, variable {variable!r} ({standard_name}, {units})"
+    if standard_name == _REFLECTIVITY:
+        text += f" clipped to [{scaling.dbz_floor:g}, {scaling.dbz_ceiling:g}] dBZ"
+    return text
 
 
 def _describe_truth(dataset: VerificationDataset) -> str:
     return _describe_source(
-        dataset.ds.attrs, dataset._path, dataset.variable, dataset.standard_name, dataset.units
+        dataset.ds.attrs,
+        dataset._path,
+        dataset.variable,
+        dataset.standard_name,
+        dataset.units,
+        dataset.scaling,
     )
 
 
@@ -1168,13 +1236,14 @@ storage_options, forecast_source, device, batch_size, num_workers, member_chunk,
         ``init_time``), so they never have to fit in memory; an existing store is
         replaced. Default: keep the forecasts in memory.
     **dataset_kwargs
-        Passed to :class:`VerificationDataset` (``on_missing``, ``to_mm_per_hour``, ...).
+        Passed to :class:`VerificationDataset` (``on_missing``, ``scaling``, ...).
 
     Returns
     -------
     xr.Dataset
-        Variable ``tp`` ``(forecast_source, init_time, lead_time, member, y, x)``
-        float32 in ``mm h-1``, with ``forecast_source`` of length 1 and the source's
+        Variable ``tp`` (rain rates) or ``dbz`` (reflectivities)
+        ``(forecast_source, init_time, lead_time, member, y, x)`` float32 in the units
+        of the source variable, with ``forecast_source`` of length 1 and the source's
         ``x``/``y`` coordinates; global attributes describe the run. With `out`, the
         store opened lazily with ``xr.open_zarr``.
     """
@@ -1223,11 +1292,8 @@ def _forecast_run(
         cv.MEMBER: np.arange(ensemble_size),
         **dataset.grid_coords(),
     }
-    var_attrs = {
-        "units": "mm h-1",
-        "long_name": "precipitation rate",
-        "standard_name": "rainfall_rate",
-    }
+    name = dataset.score_variable
+    var_attrs = _variable_attrs(dataset.standard_name, dataset.units)
     attrs = {
         "title": f"Forecasts of {run.forecast_source} ({run.split} split)",
         "forecasts": _describe_forecasts(run, ensemble_size),
@@ -1241,7 +1307,7 @@ def _forecast_run(
 
     def to_dataset(values: np.ndarray, init_times: np.ndarray) -> xr.Dataset:
         return xr.Dataset(
-            {cv.VARIABLE: (cv.FORECAST_DIMS, values[None], var_attrs)},
+            {name: (cv.FORECAST_DIMS, values[None], var_attrs)},
             coords={**static_coords, cv.INIT_TIME: init_times},
             attrs=attrs,
         )
@@ -1276,7 +1342,7 @@ def _forecast_run(
                 if not written:
                     _, t, m, h, w = values.shape
                     encoding = {
-                        cv.VARIABLE: {"chunks": (1, 1, t, m, h, w)},
+                        name: {"chunks": (1, 1, t, m, h, w)},
                         cv.INIT_TIME: {"units": "seconds since 1970-01-01", "dtype": "int64"},
                     }
                     ds.to_zarr(out, mode="w", encoding=encoding)
@@ -1298,16 +1364,17 @@ def open_truth(
     zarr_path: str | os.PathLike | None = None,
     storage_options: dict[str, Any] | None = None,
     region: dict[str, slice] | None = None,
-    to_mm_per_hour: float | None = None,
+    scaling: ReflectivityScaling | None = None,
 ) -> xr.Dataset:
     """
-    The radar truth of a training run: its source variable as ``tp`` in mm/h, lazily.
+    The radar truth of a training run: its source variable in its own units, lazily.
 
     The source Zarr and the variable are found as in :class:`VerificationDataset`
     (the run's ``data.dataset_factory``: ``zarr_path``, ``storage_options`` and the
-    variable with the run's standard name), and the values are converted to mm/h with
-    the factor of its ``units`` (:func:`mm_per_hour_factor`). Times listed in a
-    ``missing_times`` coordinate are dropped.
+    variable with the run's standard name). The values are those the scores of
+    :func:`verify_mlcast_run` are computed against: unconverted, reflectivities
+    clipped to ``[dbz_floor, dbz_ceiling]``. Times listed in a ``missing_times``
+    coordinate are dropped.
 
     Parameters
     ----------
@@ -1318,14 +1385,17 @@ def open_truth(
     region : dict, optional
         Integer index slices ``{"y": slice, "x": slice}``, the same sub-domain as given
         to :func:`forecast_mlcast` so that the grids match. Default: full domain.
-    to_mm_per_hour : float, optional
-        Factor to mm/h; default from the variable's ``units``.
+    scaling : mlcast.data.normalization.ReflectivityScaling, optional
+        Scaling constants (for the reflectivity clipping), default mlcast's
+        ``DEFAULT_SCALING``.
 
     Returns
     -------
     xr.Dataset
-        Variable ``tp`` ``(time, y, x)`` in ``mm h-1`` (NaN = invalid) with the source's
-        ``x``/``y`` coordinates, dask-backed.
+        Variable ``tp`` (rain rates) or ``dbz`` (reflectivities) ``(time, y, x)`` in the
+        units of the source variable (NaN = invalid) with the source's ``x``/``y``
+        coordinates, dask-backed. Same name and units as the forecasts of
+        :func:`forecast_mlcast`.
     """
     config, _ = _resolve_config(
         config, data_root=data_root, zarr_path=zarr_path, storage_options=storage_options
@@ -1340,7 +1410,9 @@ def open_truth(
     t_dim = VerificationDataset._time_dim(da)
     y_dim, x_dim = _spatial_dims(da, t_dim)
     units = da.attrs.get("units")
-    factor = float(to_mm_per_hour) if to_mm_per_hour is not None else mm_per_hour_factor(units)
+    if units is None:
+        raise ValueError(f"variable {variable!r} has no `units` attribute")
+    scaling = scaling or DEFAULT_SCALING
 
     region = dict(region or {})
     if set(region) - {"y", "x"}:
@@ -1350,7 +1422,7 @@ def open_truth(
     if "missing_times" in source.variables:
         missing = source["missing_times"].values.astype("datetime64[ns]")
         da = da.isel({t_dim: ~np.isin(da[t_dim].values.astype("datetime64[ns]"), missing)})
-    values = da.data if factor == 1.0 else da.data * np.float32(factor)
+    values = _truth_values(da.data, standard_name, scaling)
 
     coords: dict[str, Any] = {cv.TIME: (cv.TIME, da[t_dim].values, dict(da[t_dim].attrs))}
     for name, dim in ((cv.Y, y_dim), (cv.X, x_dim)):
@@ -1358,14 +1430,16 @@ def open_truth(
             coords[name] = (name, da[dim].values, dict(da[dim].attrs))
     return xr.Dataset(
         {
-            cv.VARIABLE: (
+            cv.SHORT_NAMES[standard_name]: (
                 cv.TRUTH_DIMS,
                 values,
-                {"units": "mm h-1", "long_name": "precipitation rate", "source_variable": variable},
+                {**_variable_attrs(standard_name, str(units)), "source_variable": variable},
             )
         },
         coords=coords,
-        attrs={"truth": _describe_source(source.attrs, path, variable, standard_name, units)},
+        attrs={
+            "truth": _describe_source(source.attrs, path, variable, standard_name, units, scaling)
+        },
     )
 
 
@@ -1432,7 +1506,7 @@ def verify_mlcast_run(
     num_workers, seed, compute_psd, member_chunk, progress
         See :func:`verify_mlcast_model`.
     **dataset_kwargs
-        Passed to :class:`VerificationDataset` (``on_missing``, ``to_mm_per_hour``, ...).
+        Passed to :class:`VerificationDataset` (``on_missing``, ``zero_threshold``, ...).
 
     Returns
     -------
@@ -1491,7 +1565,6 @@ def _prepare_run_from_args(args: argparse.Namespace) -> _Run:
         storage_options=args.storage_options,
         region=region or None,
         on_missing=args.on_missing,
-        to_mm_per_hour=args.to_mm_per_hour,
     )
 
 
