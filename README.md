@@ -35,11 +35,16 @@ subsets of cases (a season, rainy days) to be selected later.
 Every metric is computed per case and lead time, then stored. Averaging over cases and
 the quantities derived from those averages are computed at plot time.
 
+Scores are computed in the **native units of the verified variable**, without unit
+conversion (see [Units](#units)). The table shows a rain rate `tp` in mm h-1, as in the
+paper; for e.g. a radar reflectivity `dbz` in dBZ the scores are `mae.dbz` in dBZ,
+`psd.dbz` in dBZ2 km, and so on.
+
 | Metric | Paper | Stored as | Extra dim | Units | Polarity | Plot-time derivation |
 |---|---|---|---|---|---|---|
 | MAE of the ensemble mean | Eq. 21, Fig. 4 | `mae.tp` | – | mm h-1 | known | mean over cases |
 | CRPS (ensemble estimator) | Eqs. 8, 22, Fig. 5 | `crps.tp` | – | mm h-1 | known | mean over cases |
-| Rank histogram (rel. frequency; values < 0.037 mm/h set to 0, random tie-breaking) | Eq. 23, Fig. 6 | `rank_histogram.tp` | `rank` | 1 | `neutral` (declared) | mean over cases (and lead times for "full forecast") |
+| Rank histogram (rel. frequency; values < 0.037 mm/h count as zero, random tie-breaking) | Eq. 23, Fig. 6 | `rank_histogram.tp` | `rank` | 1 | `neutral` (declared) | mean over cases (and lead times for "full forecast") |
 | Rank-histogram RMSD from uniform | Eq. 24, Fig. 6 | — | | | | from the case-averaged histogram |
 | Radial PSD, forecast (mean over members) | Eqs. 16–17, Fig. 7 | `psd.tp` | `wavelength` (km) | mm2 h-2 km | `activity` (declared) | mean over cases |
 | Radial PSD, observation | Eqs. 16–17, Fig. 7 | `psd_obs.tp` | `wavelength` (km) | mm2 h-2 km | `activity` (declared) | mean over cases |
@@ -96,7 +101,7 @@ checkpoint = "logs/mlcast/version_3/checkpoints/best.ckpt"
 
 # a) forecast first (written to Zarr batch by batch), then score
 ds_forecasts = forecast_mlcast(config, checkpoint, ensemble_size=20, out="forecasts.zarr")
-ds_truth = open_truth(config)                     # the run's radar data, in mm/h
+ds_truth = open_truth(config)                     # the run's radar data, in its own units
 scores = compute_scores(ds_forecasts, ds_truth)  # on the GPU if available
 
 # b) or forecast and score on the fly on the GPU, never storing the forecasts
@@ -110,12 +115,14 @@ plot_all(scores, "figures/")
 Both paths give the same scores for the same arguments and seed. Forecasts of other
 models can be scored in the same way, by building `ds_forecasts` yourself:
 
-- `ds_forecasts`: data variable `tp` with dims
-  `(forecast_source, init_time, lead_time, member, y, x)` and a `units` attribute
-  (mm/h, kg m-2 h-1 or kg m-2 s-1). Sources with fewer members are NaN-padded along
-  `member`; the `forecast_source` dim may instead be a scalar coordinate.
-- `ds_truth`: data variable `tp` with dims `(time, y, x)` on the same grid and a `units`
-  attribute; NaN marks invalid pixels.
+- `ds_forecasts`: a data variable (default `tp`, choose with `variable=`) with dims
+  `(forecast_source, init_time, lead_time, member, y, x)` and a `units` attribute.
+  Sources with fewer members are NaN-padded along `member`; the `forecast_source` dim
+  may instead be a scalar coordinate.
+- `ds_truth`: the same data variable with dims `(time, y, x)` on the same grid, in the
+  same units; NaN marks invalid pixels.
+
+The scores are named after the variable (`mae.tp`, `mae.dbz`, ...) and are in its units.
 
 Scores of different sources are combined with
 `mlcast_verification_tools.accumulator.merge_sources`.
@@ -166,6 +173,27 @@ Synthetic end-to-end demo (scoring → spec file → validation → figures):
 ```bash
 uv run --extra cpu python examples/synthetic_demo.py --out demo_output
 ```
+
+## Units
+
+Forecasts and observations are scored in the native units of the verified variable;
+nothing is converted (e.g. no Z-R relation is assumed for reflectivities). Scores in
+different units (e.g. dBZ and mm/h, or mm/h and kg m-2 s-1) are not comparable, and
+`merge_sources` refuses to merge them.
+
+For an mlcast run the variable comes from the run's `standard_names`:
+
+| Source `standard_name` | Scores | Rank-histogram zero threshold | Truth |
+|---|---|---|---|
+| `rainfall_rate`, `rainfall_flux` | `*.tp`, in the source units (e.g. kg m-2 h-1) | 0.037 mm/h, in the source units | as stored |
+| `equivalent_reflectivity_factor` | `*.dbz`, in dBZ | mlcast's `dbz_floor` (0 dBZ) | clipped to mlcast's `[dbz_floor, dbz_ceiling]` (0–60 dBZ) |
+
+The model can only predict reflectivities in mlcast's `[dbz_floor, dbz_ceiling]` range
+(its inputs are clipped to it during training), so the observations are clipped to the
+same range; otherwise a "no echo" value far below the floor (e.g. -32 dBZ) would
+dominate the errors. For stored forecasts (`compute_scores`, `mlcast.verify score`) the
+threshold defaults to the same values from the `units` attribute; pass
+`zero_threshold=` for other units.
 
 ## Notes on the format
 

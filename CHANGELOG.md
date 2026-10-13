@@ -7,7 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Changed
+
+- Scores are computed in the native units of the verified variable instead of being
+  converted to mm/h, and named after it (`mae.tp`, `mae.dbz`, ...); their `units`
+  attributes follow the variable (e.g. `dBZ` and `dBZ2 km` for MAE and PSD). Rain-rate
+  sources in e.g. kg m-2 s-1 are now scored in kg m-2 s-1. `compute_scores` requires
+  forecasts and truth in the same units, and `merge_sources` refuses to merge scores in
+  different units. The `to_mm_per_hour` arguments and `--to-mm-per-hour` are removed;
+  `open_truth` and `forecast_mlcast` return the variable in the source's units.
+  `mlcast.verify score --variable` defaults to the forecasts' single data variable.
+- The rank histogram treats values below its zero threshold as tied below all other
+  values, which works in any units (same ranks as before for rain rates). The threshold
+  defaults to 0.037 mm/h expressed in the variable's units (`default_zero_threshold`).
+
 ### Added
+
+- Verification of mlcast models trained on radar reflectivity
+  (`equivalent_reflectivity_factor`, dBZ): forecasts are de-normalised to dBZ, the
+  observations are clipped to mlcast's `[dbz_floor, dbz_ceiling]`, and the rank-histogram
+  zero threshold is `dbz_floor`.
 
 - Per-case verification scores for precipitation nowcasts, computed with torch on
   CPU or GPU: MAE of the ensemble mean, CRPS, rank histogram and radially averaged
