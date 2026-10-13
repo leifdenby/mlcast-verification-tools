@@ -27,7 +27,7 @@ from mlcast.data.normalization import DEFAULT_SCALING, ReflectivityScaling
 from torch.utils.data import DataLoader, Dataset
 
 from .. import conventions as cv
-from ..accumulator import ScoreAccumulator
+from ..accumulator import ScoreAccumulator, merge_sources
 from ..units import default_zero_threshold, mm_per_hour_factor  # noqa: F401 - re-exported
 from .mlcast import PRECISIONS, SUPPORTED_STANDARD_NAMES
 
@@ -46,6 +46,13 @@ _CONFIG_YAML_NAME = "config.yaml"
 
 
 _REFLECTIVITY = "equivalent_reflectivity_factor"
+
+#: Name of the persistence baseline among the forecast sources of the scores.
+PERSISTENCE_SOURCE = "persistence"
+_PERSISTENCE_DESCRIPTION = (
+    "the last observed input frame at every lead time (one deterministic member), "
+    "scored on the same cases and pixels"
+)
 
 _LONG_NAMES = {
     "rainfall_rate": "rainfall rate",
@@ -650,7 +657,8 @@ class VerificationDataset(Dataset):
     Notes
     -----
     Items are dicts with ``input`` (T_in, 1, H, W) float32 normalised, ``target``
-    (T_out, H, W) float32 in the source units with NaN kept, ``mask`` (H, W) bool and
+    (T_out, H, W) float32 in the source units with NaN kept, ``last_obs`` (H, W) the last
+    input frame as the targets (the persistence forecast), ``mask`` (H, W) bool and
     ``init_time`` (int64 ns since the epoch, so it collates into a tensor). In crop mode
     an item is still a full-domain case, with ``crops`` (N, 2) int64 holding the
     ``(y, x)`` corners of its N crops; the forecast loop cuts the crops out of the
@@ -1010,12 +1018,14 @@ class VerificationDataset(Dataset):
         normed = _normalize_numpy(raw, self.standard_name, self.scaling)
         mask = ~np.isnan(normed).any(axis=0)
         inputs = np.nan_to_num(normed[: self.input_steps], nan=self.scaling.norm_min)
-        target = _truth_values(
-            raw[self.input_steps :].astype(np.float32), self.standard_name, self.scaling
+        # targets and the last input frame (the persistence forecast) as the truth is scored
+        observed = _truth_values(
+            raw[self.input_steps - 1 :].astype(np.float32), self.standard_name, self.scaling
         )
         item = {
             "input": torch.from_numpy(np.ascontiguousarray(inputs[:, None], dtype=np.float32)),
-            "target": torch.from_numpy(np.ascontiguousarray(target)),
+            "target": torch.from_numpy(np.ascontiguousarray(observed[1:])),
+            "last_obs": torch.from_numpy(np.ascontiguousarray(observed[0])),
             "mask": torch.from_numpy(mask),
             "init_time": torch.tensor(
                 self.init_times[idx].astype("datetime64[ns]").astype(np.int64)
@@ -1108,6 +1118,7 @@ def verify_mlcast_model(
     compute_psd: bool = True,
     member_chunk: int | None = None,
     precision: str = "fp32",
+    persistence: bool = True,
     progress: bool = True,
 ) -> xr.Dataset:
     """
@@ -1117,6 +1128,11 @@ def verify_mlcast_model(
     ``[norm_min, norm_max]`` (as in training) -> :func:`denormalize_torch` (to the
     source units) -> :meth:`ScoreAccumulator.update` on the device; the forecast tensor
     is then freed. Scores are in the native units of the source variable.
+
+    With `persistence`, the persistence baseline is scored in the same pass on the same
+    cases, pixels and crops, as forecast source ``"persistence"``: the last input
+    frame (in the source units, prepared like the truth) at every lead time, a single
+    deterministic member (its CRPS equals its MAE, its rank histogram has 2 ranks).
 
     Parameters
     ----------
@@ -1154,6 +1170,8 @@ def verify_mlcast_model(
         Run the model in float32, or under ``torch.autocast`` to bfloat16 (about twice
         as fast on GPUs with bf16 tensor cores). The forecast is cast to float32 before
         it is de-normalised and scored either way.
+    persistence : bool
+        Also score the persistence baseline (see above).
     progress : bool
         Print a summary panel of the cases, model and batching to stderr (as mlcast's
         sampler does) and show a tqdm progress bar, with the mean time per batch spent
@@ -1164,20 +1182,29 @@ def verify_mlcast_model(
     Returns
     -------
     xr.Dataset
-        Score dataset in the spec layout, without global attributes.
+        Score dataset in the spec layout, without global attributes; with
+        `persistence`, ``forecast_source`` is ``[forecast_source, "persistence"]`` and
+        the rank histogram of persistence is NaN beyond its 2 ranks.
     """
-    acc = ScoreAccumulator(
-        forecast_source,
-        dataset.lead_times,
-        dataset.dx_km,
-        variable=dataset.score_variable,
-        units=dataset.units,
-        zero_threshold=dataset.zero_threshold,
-        seed=seed,
-        compute_psd=compute_psd,
-        # crop mode: the scores of the crops of an init time are pooled
-        pool_by_init_time=dataset.crop_size is not None,
-    )
+    if persistence and forecast_source == PERSISTENCE_SOURCE:
+        raise ValueError(f"forecast_source {PERSISTENCE_SOURCE!r} is taken by the baseline")
+
+    def accumulator(source: str) -> ScoreAccumulator:
+        return ScoreAccumulator(
+            source,
+            dataset.lead_times,
+            dataset.dx_km,
+            variable=dataset.score_variable,
+            units=dataset.units,
+            zero_threshold=dataset.zero_threshold,
+            seed=seed,
+            compute_psd=compute_psd,
+            # crop mode: the scores of the crops of an init time are pooled
+            pool_by_init_time=dataset.crop_size is not None,
+        )
+
+    acc = accumulator(forecast_source)
+    acc_persistence = accumulator(PERSISTENCE_SOURCE) if persistence else None
     batches = _iter_forecasts(
         model,
         dataset,
@@ -1191,12 +1218,38 @@ def verify_mlcast_model(
         progress=progress,
         desc=f"verifying {forecast_source}",
         consumer="score",
+        baseline=PERSISTENCE_SOURCE if persistence else None,
     )
     with torch.inference_mode():
-        for preds, obs, mask, init_times in batches:
-            acc.update(preds, obs, mask, init_times)
-            del preds, obs, mask
-    return acc.to_dataset()
+        for batch in batches:
+            acc.update(batch.fc, batch.obs, batch.mask, batch.init_times)
+            if acc_persistence is not None:
+                acc_persistence.update(
+                    _persistence_forecast(batch.last_obs, len(dataset.lead_times)),
+                    batch.obs,
+                    batch.mask,
+                    batch.init_times,
+                )
+            del batch
+    if acc_persistence is None:
+        return acc.to_dataset()
+    return merge_sources([acc.to_dataset(), acc_persistence.to_dataset()])
+
+
+def _persistence_forecast(last_obs: torch.Tensor, n_lead_times: int) -> torch.Tensor:
+    """The last observed frame ``(B, H, W)`` at every lead time, ``(B, T, 1, H, W)``."""
+    b, h, w = last_obs.shape
+    return last_obs[:, None, None].expand(b, n_lead_times, 1, h, w)
+
+
+class _Batch(NamedTuple):
+    """A batch of forecasts as yielded by :func:`_iter_forecasts`."""
+
+    fc: torch.Tensor  # (B, T, M, H, W) source units
+    obs: torch.Tensor  # (B, T, H, W) source units, NaN -> 0 (outside `mask`)
+    mask: torch.Tensor  # (B, H, W) bool
+    init_times: np.ndarray  # (B,) datetime64[ns]
+    last_obs: torch.Tensor  # (B, H, W) last input frame as `obs`, NaN -> 0
 
 
 def _iter_forecasts(
@@ -1213,7 +1266,8 @@ def _iter_forecasts(
     progress: bool = True,
     desc: str = "forecasting",
     consumer: str = "score",
-) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor, np.ndarray]]:
+    baseline: str | None = None,
+) -> Iterator[_Batch]:
     """
     Run the model over the cases of `dataset`, batch by batch.
 
@@ -1224,18 +1278,17 @@ def _iter_forecasts(
     With `progress`, the progress bar shows the mean time per batch spent waiting for
     the DataLoader (``data``), in the model (``model``) and in the consumer of the
     yielded tensors (labelled `consumer`, the time until the next batch is requested).
+    `baseline` names a baseline the consumer also scores, for the summary panel.
 
     Yields
     ------
-    fc : torch.Tensor
-        Forecast ``(B, T, M, H, W)`` in the source units on the device.
-    obs : torch.Tensor
-        Observation ``(B, T, H, W)`` in the source units on the device, NaN replaced by 0 (NaN
-        pixels are outside `mask`).
-    mask : torch.Tensor
-        Boolean ``(B, H, W)`` on the device: finite at all input and target steps.
-    init_times : np.ndarray
-        ``datetime64[ns]`` init times of the B cases.
+    _Batch
+        ``fc`` forecast ``(B, T, M, H, W)`` in the source units on the device; ``obs``
+        observation ``(B, T, H, W)`` in the source units on the device, NaN replaced by 0
+        (NaN pixels are outside ``mask``); ``mask`` boolean ``(B, H, W)`` on the device,
+        finite at all input and target steps; ``init_times`` ``datetime64[ns]`` init
+        times of the B cases; ``last_obs`` ``(B, H, W)`` the last input frame as ``obs``.
+        In crop mode B counts crops (of one case), cut out of the full-domain tensors.
     """
     _check_precision(precision)
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -1273,6 +1326,7 @@ def _iter_forecasts(
             num_workers=num_workers,
             device=device,
             precision=precision,
+            baseline=baseline,
         )
         try:
             from tqdm.auto import tqdm
@@ -1293,6 +1347,8 @@ def _iter_forecasts(
             mask = batch["mask"].to(device, non_blocking=True)
             obs = batch["target"].to(device, non_blocking=True)
             obs = torch.nan_to_num(obs, nan=0.0)  # NaN obs are outside `mask`
+            last_obs = batch["last_obs"].to(device, non_blocking=True)
+            last_obs = torch.nan_to_num(last_obs, nan=0.0)  # NaN is outside `mask` too
             init_times = batch["init_time"].numpy().astype("datetime64[ns]")
 
             preds = _forecast(model, x, dataset.forecast_steps, chunks, precision)
@@ -1301,11 +1357,13 @@ def _iter_forecasts(
             del x
         if timer:
             timer.lap("model")
+        full = _Batch(preds, obs, mask, init_times, last_obs)
+        del preds, obs, mask, last_obs
         if crop_mode:
-            pieces = _crop_pieces(preds, obs, mask, init_times, batch["crops"], dataset.crop_size)
+            pieces = _crop_pieces(full, batch["crops"], dataset.crop_size)
         else:
-            pieces = iter([(preds, obs, mask, init_times)])
-        del preds, obs, mask
+            pieces = iter([full])
+        del full
         for piece in pieces:
             yield piece
             del piece
@@ -1352,6 +1410,7 @@ def _print_summary(
     num_workers: int,
     device: torch.device,
     precision: str,
+    baseline: str | None = None,
 ) -> None:
     """Print a panel of what is about to be forecast to stderr, as mlcast's sampler does."""
     from rich.console import Console
@@ -1407,6 +1466,8 @@ def _print_summary(
     )
     grid.add_row("Model", f"🧠  {_describe_model(model)}")
     grid.add_row("Ensemble", f"🎲  {ensemble_size} members   {calls}")
+    if baseline == PERSISTENCE_SOURCE:
+        grid.add_row("Baseline", f"📏  {PERSISTENCE_SOURCE}: {_PERSISTENCE_DESCRIPTION}")
     grid.add_row(
         "Workload",
         f"🧮  {n_cases:,} cases × {ensemble_size} members × {dataset.forecast_steps} steps"
@@ -1446,23 +1507,17 @@ _CROP_CHUNK_ELEMENTS = 2**28
 
 
 def _crop_pieces(
-    preds: torch.Tensor,
-    obs: torch.Tensor,
-    mask: torch.Tensor,
-    init_times: np.ndarray,
-    corners: list[torch.Tensor],
-    crop_size: tuple[int, int],
-) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor, np.ndarray]]:
+    full: _Batch, corners: list[torch.Tensor], crop_size: tuple[int, int]
+) -> Iterator[_Batch]:
     """
     Cut the crops out of full-domain forecasts, in chunks of crops of one case.
 
-    `preds` ``(B, T, M, H, W)``, `obs` ``(B, T, H, W)`` and `mask` ``(B, H, W)`` are the
-    batch's full-domain tensors, ``corners[b]`` ``(N_b, 2)`` the ``(y, x)`` corners of
-    the crops of case ``b``. Yields ``(n, T, M, h, w)``, ``(n, T, h, w)``, ``(n, h, w)``
-    and the case's init time repeated ``n`` times.
+    `full` holds the batch's full-domain tensors, ``corners[b]`` ``(N_b, 2)`` the
+    ``(y, x)`` corners of the crops of case ``b``. Yields batches of ``n`` crops of one
+    case, with its init time repeated ``n`` times.
     """
     h, w = crop_size
-    _, t, m, _, _ = preds.shape
+    _, t, m, _, _ = full.fc.shape
     chunk = max(1, _CROP_CHUNK_ELEMENTS // (t * m * h * w))
     for b, case_corners in enumerate(corners):
         case_corners = case_corners.tolist()
@@ -1472,7 +1527,13 @@ def _crop_pieces(
             def cut(tensor: torch.Tensor, part=part, b=b) -> torch.Tensor:
                 return torch.stack([tensor[b, ..., y : y + h, x : x + w] for y, x in part])
 
-            yield cut(preds), cut(obs), cut(mask), np.repeat(init_times[b : b + 1], len(part))
+            yield _Batch(
+                cut(full.fc),
+                cut(full.obs),
+                cut(full.mask),
+                np.repeat(full.init_times[b : b + 1], len(part)),
+                cut(full.last_obs),
+            )
 
 
 class _StageTimer:
@@ -1781,11 +1842,13 @@ def _forecast_run(
         consumer="write",
     )
     with torch.inference_mode():
-        for preds, _obs, mask, init_times in batches:
+        for batch in batches:
+            preds, mask, init_times = batch.fc, batch.mask, batch.init_times
+            del batch
             # no forecast where mlcast's validity mask (inputs and targets) is False
             preds.masked_fill_(~mask[:, None, None], float("nan"))
             values = preds.to(torch.float32).cpu().numpy()
-            del preds, _obs, mask
+            del preds, mask
             if out is None:
                 pieces.append((values, init_times))
                 continue
@@ -1920,6 +1983,7 @@ def verify_mlcast_run(
     compute_psd: bool = True,
     member_chunk: int | None = None,
     precision: str = "fp32",
+    persistence: bool = True,
     progress: bool = True,
     **dataset_kwargs: Any,
 ) -> xr.Dataset:
@@ -1931,9 +1995,10 @@ def verify_mlcast_run(
     (:meth:`VerificationDataset.from_mlcast_config`: the unique init times of the
     crops mlcast samples for the split, forecast over the full domain, or with
     `crops` scoring only the crops) and scores them on the fly
-    (:func:`verify_mlcast_model`); forecasts are never stored. Over the full domain
-    the same as ``compute_scores(forecast_mlcast(config, checkpoint, ...),
-    open_truth(config))`` with the same arguments.
+    (:func:`verify_mlcast_model`), by default with the persistence baseline;
+    forecasts are never stored. Over the full domain the model's scores are those of
+    ``compute_scores(forecast_mlcast(config, checkpoint, ...), open_truth(config))``
+    with the same arguments.
 
     Parameters
     ----------
@@ -1969,7 +2034,7 @@ def verify_mlcast_run(
     max_crops : int, optional
         With `crops`, evenly subsample the crops to at most this many (after
         `max_cases`).
-    num_workers, seed, compute_psd, member_chunk, precision, progress
+    num_workers, seed, compute_psd, member_chunk, precision, persistence, progress
         See :func:`verify_mlcast_model`.
     **dataset_kwargs
         Passed to :class:`VerificationDataset` (``on_missing``, ``zero_threshold``, ...).
@@ -2009,6 +2074,7 @@ def verify_mlcast_run(
         compute_psd=compute_psd,
         member_chunk=member_chunk,
         precision=precision,
+        persistence=persistence,
         progress=progress,
     )
 
@@ -2075,13 +2141,17 @@ def verify_trained_model_from_args(args: argparse.Namespace) -> int:
         compute_psd=not args.no_psd,
         member_chunk=args.member_chunk,
         precision=args.precision,
+        persistence=not args.no_persistence,
         progress=not args.no_progress,
     )
+    forecasts = args.forecasts or _describe_forecasts(run, args.ensemble_size, args.precision)
+    if not args.no_persistence and not args.forecasts:
+        forecasts += f"; {PERSISTENCE_SOURCE}: {_PERSISTENCE_DESCRIPTION}"
     path = write_scores(
         scores,
         args.out,
         title=args.title or f"Verification scores of {run.forecast_source} ({args.split} split)",
-        forecasts=args.forecasts or _describe_forecasts(run, args.ensemble_size, args.precision),
+        forecasts=forecasts,
         truth=args.truth or _describe_truth(run.dataset),
         created_by=args.created_by,
         created_with=args.created_with,

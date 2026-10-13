@@ -295,6 +295,12 @@ def build_verify_trained_model_parser(
     )
     g.add_argument("--out", required=True, help="output score file (.nc) or Zarr store")
     g.add_argument("--no-psd", action="store_true", help="skip the radial power spectra")
+    g.add_argument(
+        "--no-persistence",
+        action="store_true",
+        help="don't score the persistence baseline (the last observed frame at every lead "
+        "time), which is otherwise added as forecast source 'persistence'",
+    )
     g.add_argument("--no-progress", action="store_true")
     g.add_argument("--title", help="title of the score dataset (default: generated)")
     g.add_argument(

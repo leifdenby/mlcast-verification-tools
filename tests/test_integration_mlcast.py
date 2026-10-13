@@ -338,7 +338,9 @@ def test_member_chunks():
 def _check_scores(
     scores: xr.Dataset, n_cases: int, n_members: int, psd: bool = True, variable: str = "tp"
 ) -> None:
-    assert dict(scores.sizes)[cv.FORECAST_SOURCE] == 1
+    """The model is the first source; persistence (scored by default) may follow."""
+    sources = scores[cv.FORECAST_SOURCE].values.tolist()
+    assert len(sources) == 1 or sources[1:] == ["persistence"], sources
     assert scores.sizes[cv.INIT_TIME] == n_cases
     assert scores.sizes[cv.LEAD_TIME] == FORECAST_STEPS
     assert scores.sizes[cv.RANK] == n_members + 1
@@ -346,8 +348,14 @@ def _check_scores(
     if psd:
         names |= {cv.var_name(cv.PSD, variable), cv.var_name(cv.PSD_OBS, variable)}
     assert names <= set(scores.data_vars)
-    for name in names:
-        assert np.isfinite(scores[name].values).all(), name
+    rank_name = cv.var_name(cv.RANK_HISTOGRAM, variable)
+    for source in sources:
+        one = scores.sel({cv.FORECAST_SOURCE: source})
+        if source == "persistence":  # one member: 2 ranks, NaN-padded to the model's
+            one = one.isel({cv.RANK: slice(0, 2)})
+            np.testing.assert_allclose(one[rank_name].sum(cv.RANK).values, 1.0)
+        for name in names:
+            assert np.isfinite(one[name].values).all(), (source, name)
     assert scores[cv.LEAD_TIME].values[0] == np.timedelta64(5, "m")
 
 
@@ -364,10 +372,30 @@ def test_verify_smoke(source_path):
     scores = mi.verify_mlcast_model(AdapterModel(), ds, **kwargs)
     _check_scores(scores, 4, 3)
     np.testing.assert_array_equal(scores[cv.INIT_TIME].values, init_times)
-    assert scores[cv.FORECAST_SOURCE].values.tolist() == ["convgru"]
+    assert scores[cv.FORECAST_SOURCE].values.tolist() == ["convgru", "persistence"]
     # same seed -> same ensemble -> same scores
     again = mi.verify_mlcast_model(AdapterModel(), ds, **kwargs)
     xr.testing.assert_identical(scores, again)
+
+    # the model's scores don't depend on the baseline
+    alone = mi.verify_mlcast_model(AdapterModel(), ds, persistence=False, **kwargs)
+    assert alone[cv.FORECAST_SOURCE].values.tolist() == ["convgru"]
+    xr.testing.assert_allclose(alone, scores.sel({cv.FORECAST_SOURCE: ["convgru"]}))
+
+    # persistence: the last input frame at every lead time, one member
+    pers = scores.sel({cv.FORECAST_SOURCE: "persistence"})
+    np.testing.assert_allclose(pers["crps.tp"].values, pers["mae.tp"].values, rtol=1e-6)
+    for i in range(len(ds)):
+        item = ds[i]
+        mask = item["mask"].numpy()
+        last = item["last_obs"].numpy()
+        expected = [np.abs(last - obs)[mask].mean() for obs in item["target"].numpy()]
+        np.testing.assert_allclose(pers["mae.tp"].values[i], expected, rtol=1e-5)
+    raw = xr.open_zarr(source_path)["RR"].sel(time=init_times[0]).values
+    np.testing.assert_array_equal(ds[0]["last_obs"].numpy(), raw)
+
+    with pytest.raises(ValueError, match="taken by the baseline"):
+        mi.verify_mlcast_model(AdapterModel(), ds, **{**kwargs, "forecast_source": "persistence"})
 
 
 def test_verify_reflectivity_source():
@@ -1006,7 +1034,8 @@ def test_verify_mlcast_run(data_root, run_dir, tmp_path, offline_metadata):
         progress=False,
     )
     _check_scores(scores, 3, 3)
-    assert scores[cv.FORECAST_SOURCE].values.tolist() == ["version_0"]  # run directory name
+    # the run directory name, and the persistence baseline
+    assert scores[cv.FORECAST_SOURCE].values.tolist() == ["version_0", "persistence"]
     cfg = mi.load_run_config(run_dir / "config.yaml", data_root=data_root)
     assert set(scores[cv.INIT_TIME].values) <= set(mi.split_init_times(cfg).values)
 
@@ -1135,6 +1164,9 @@ def test_open_truth_reflectivity(dbz_data_root, dbz_run_dir):
 
 
 def _assert_scores_equal(got: xr.Dataset, expected: xr.Dataset) -> None:
+    """`got` equals the sources of `expected` it has (forecast-then-score has no persistence)."""
+    sources = got[cv.FORECAST_SOURCE].values
+    expected = expected.sel({cv.FORECAST_SOURCE: sources})
     assert set(got.data_vars) == set(expected.data_vars)
     for coord in (cv.FORECAST_SOURCE, cv.INIT_TIME, cv.LEAD_TIME):
         np.testing.assert_array_equal(got[coord].values, expected[coord].values)
@@ -1234,6 +1266,14 @@ def test_verify_trained_model_cli(data_root, run_dir, monkeypatch):
     assert main(argv) == 0
     scores = open_scores(out).load()
     _check_scores(scores, 4, 3)
+    assert scores[cv.FORECAST_SOURCE].values.tolist() == ["version_0", "persistence"]
+    assert "; persistence: the last observed input frame" in scores.attrs["forecasts"]
+    # the model and persistence plot together (persistence's rank histogram is NaN-padded)
+    assert main(["plot", str(out), "--out", str(data_root / "figures")]) == 0
+    assert any((data_root / "figures").iterdir())
+    no_baseline = data_root / "no_baseline.nc"
+    assert main([*argv[:-1], str(no_baseline), "--no-persistence"]) == 0
+    assert open_scores(no_baseline)[cv.FORECAST_SOURCE].values.tolist() == ["version_0"]
     assert "version_0" in scores.attrs["title"] and "test split" in scores.attrs["title"]
     assert "XX-TEST v0.1.0" in scores.attrs["truth"]
     assert "init times of the test split" in scores.attrs["forecasts"]
@@ -1312,7 +1352,8 @@ def test_forecast_then_score_cli_equals_verify_cli(data_root, run_dir, monkeypat
 
     got, expected = open_scores(via_score).load(), open_scores(direct).load()
     _assert_scores_equal(got, expected)
-    assert got.attrs["forecasts"] == expected.attrs["forecasts"]
+    # the on-the-fly scores also describe the persistence baseline
+    assert expected.attrs["forecasts"].startswith(got.attrs["forecasts"] + "; persistence: ")
     assert got.attrs["truth"] == expected.attrs["truth"]
 
     # a stored truth dataset works the same

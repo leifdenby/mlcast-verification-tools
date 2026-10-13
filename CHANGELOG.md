@@ -23,6 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `verify-trained-model` (`verify_mlcast_run`, `verify_mlcast_model`) scores the
+  persistence baseline by default, as forecast source `persistence`: the last observed
+  input frame at every lead time, on the same cases, pixels and crops as the model;
+  `--no-persistence` / `persistence=False` leaves it out.
 - `verify-trained-model --crops` (`verify_mlcast_run(crops=True)`,
   `VerificationDataset(crops=, crop_size=)`): score only the crops the sampler selects for
   the split, cut out of the full-domain forecasts, with the scores of the crops of an

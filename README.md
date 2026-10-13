@@ -162,6 +162,14 @@ the window. Several crops at the same time give one case. Each case is then fore
 the **full radar domain** (or a fixed `--region-y/--region-x`), because a score file
 holds one value per source, init time and lead time.
 
+`verify-trained-model` also scores the **persistence baseline** by default, as forecast
+source `persistence`: the last observed input frame (in the source units, prepared like
+the truth) at every lead time, scored in the same pass on the same cases, pixels and
+crops as the model, at almost no extra cost. It is a single deterministic member, so its
+CRPS equals its MAE and its rank histogram has 2 ranks (NaN beyond them in the merged
+file). `--no-persistence` leaves it out; the forecast-then-score path
+(`forecast-trained-model` + `score`) scores the model only.
+
 With **`--crops`**, `verify-trained-model` still forecasts the full domain at each init
 time but **scores only the test crops** (e.g. 256×256 pixels), cut out of the forecast and
 the observation, and pools the scores of the crops of an init time: MAE, CRPS and the rank
