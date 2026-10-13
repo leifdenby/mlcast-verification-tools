@@ -6,17 +6,17 @@ import xarray as xr
 
 from mlcast_verification_tools import conventions as cv
 from mlcast_verification_tools.io import (
+    REPOSITORY_URL,
     add_global_attrs,
+    default_created_with,
     open_scores,
     validate_scores,
     write_scores,
 )
 from mlcast_verification_tools.testing import make_synthetic_scores
 
-# The spec requires the repository in `mlcast_created_with` to be named
-# `mlcast-dataset-{organisation_id}-{dataset_name}`, so the tests use the name
-# from the validator's own example rather than this package's repository.
-CREATED_WITH = "https://github.com/mlcast-community/mlcast-dataset-dmi-nowcast-scores@v0.1.0"
+# explicit provenance; any GitHub repository is accepted by the spec
+CREATED_WITH = f"{REPOSITORY_URL}@v0.1.0"
 
 ATTRS = dict(
     title="Synthetic precipitation nowcast scores",
@@ -64,16 +64,32 @@ def test_add_global_attrs_returns_copy():
 
 
 def test_add_global_attrs_defaults():
-    attrs = add_global_attrs(
-        make_synthetic_scores(),
-        title="t",
-        forecasts="f",
-        truth="r",
-        created_by="A <a@b.c>",
-        created_with=CREATED_WITH,
-    ).attrs
+    attrs = add_global_attrs(make_synthetic_scores(), title="t", forecasts="f", truth="r").attrs
     created_on = np.datetime64(attrs["mlcast_created_on"].removesuffix("+00:00"))
     assert abs(np.datetime64("now") - created_on) < np.timedelta64(1, "D")
+    # provenance is optional in the spec: no creator contact, this package as software
+    assert "mlcast_created_by" not in attrs
+    assert attrs["mlcast_created_with"] == default_created_with()
+
+
+@pytest.mark.parametrize(
+    "version, revision",
+    [
+        ("0.1.dev2+gacc2d8aff", "acc2d8aff"),
+        ("0.1.dev2+gacc2d8aff.d20261012", "acc2d8aff"),
+        ("0.2.0", "v0.2.0"),
+    ],
+)
+def test_default_created_with(version, revision):
+    assert default_created_with(version) == f"{REPOSITORY_URL}@{revision}"
+
+
+@pytest.mark.parametrize("suffix", SUFFIXES)
+def test_validate_without_provenance(tmp_path, suffix):
+    attrs = {k: v for k, v in ATTRS.items() if k not in ("created_by", "created_with")}
+    path = write_scores(make_synthetic_scores(), tmp_path / f"scores{suffix}", **attrs)
+    report = validate_scores(path)
+    assert not report.has_fails(), _problems(report)
 
 
 @pytest.mark.parametrize("suffix", SUFFIXES)

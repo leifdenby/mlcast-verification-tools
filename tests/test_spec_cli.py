@@ -1,8 +1,8 @@
 """Validate written score datasets with the validator's command line interface.
 
-The CLI runs in a subprocess, so its GitHub lookup of `mlcast_created_with` can't be
-patched out. Without network access, or if the repository doesn't exist, that lookup
-gives a WARNING (not a FAIL), so the exit code is 0 either way.
+The CLI runs in a subprocess, so its GitHub lookup of `mlcast_created_with` (this
+package's repository and revision by default) can't be patched out. Without network
+access that lookup gives a WARNING (not a FAIL), so the exit code is 0 either way.
 """
 
 from __future__ import annotations
@@ -23,9 +23,6 @@ ATTRS = dict(
     title="Synthetic precipitation nowcast scores",
     forecasts="two synthetic ensembles",
     truth="synthetic radar composite",
-    created_by="Jane Doe <jane@example.com>",
-    # repository named as the spec requires (`mlcast-dataset-{org_id}-{name}`)
-    created_with="https://github.com/mlcast-community/mlcast-dataset-dmi-nowcast-scores@v0.1.0",
 )
 
 

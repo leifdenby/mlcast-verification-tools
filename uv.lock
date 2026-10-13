@@ -2800,8 +2800,8 @@ dependencies = [
 
 [[package]]
 name = "mlcast-dataset-validator"
-version = "0.1.0.dev76+g32f5d2b64"
-source = { git = "https://github.com/leifdenby/mlcast-dataset-validator?branch=feat%2Fverification-metrics-spec#32f5d2b64097e769a38c527f711db9a4fce3c370" }
+version = "0.1.0.dev77+g58d46b548"
+source = { git = "https://github.com/leifdenby/mlcast-dataset-validator?branch=feat%2Fverification-metrics-spec#58d46b548c83d60ded1c6cbefae80f05cbbba50b" }
 dependencies = [
     { name = "dask" },
     { name = "fsspec" },

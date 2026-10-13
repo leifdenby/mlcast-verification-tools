@@ -128,8 +128,6 @@ def main() -> None:
         title="Synthetic precipitation nowcast scores (demo)",
         forecasts="synthetic ensembles 'calibrated' (8 members) and 'smoothed' (4 members)",
         truth="synthetic advected stochastic rain field",
-        created_by="MLCast demo <demo@example.com>",
-        created_with="https://github.com/mlcast-community/mlcast-dataset-demo-nowcast-scores@v0.1.0",
     )
     print(f"Wrote {path}")
 

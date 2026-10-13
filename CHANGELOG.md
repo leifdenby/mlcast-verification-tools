@@ -29,6 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The run config is loaded with mlcast's `load_yaml_config`, which replaces our own
   Fiddle YAML loader (`load_fiddle_yaml` and `build_network_from_config_yaml` are
   removed).
+- `mlcast_created_by` and `mlcast_created_with` are optional, following the
+  forecast_scoring_metrics spec (validator `58d46b5`): `write_scores` and
+  `mlcast.verify run-mlcast` no longer require `created_by`/`created_with`.
+  `mlcast_created_with` defaults to this package's repository and revision, and
+  `mlcast_created_by` is only written when given.
 - DataLoader workers of `verify_mlcast_model` are spawned instead of forked. Forked
   workers could deadlock.
 - Development setup: pre-commit hooks (ruff, pyproject-fmt), and CI workflows for

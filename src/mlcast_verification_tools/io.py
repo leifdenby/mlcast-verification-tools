@@ -27,7 +27,34 @@ NETCDF_SUFFIXES = (".nc", ".nc4", ".cdf")
 # validator isn't installed (same default as the validator's example script).
 DEFAULT_VALIDATOR_VERSION = "0.4.0"
 
+REPOSITORY_URL = "https://github.com/leifdenby/mlcast-verification-tools"
+
 PathLike = str | os.PathLike
+
+
+def default_created_with(version: str | None = None) -> str:
+    """
+    `mlcast_created_with` value naming this package's repository and revision.
+
+    The validator checks that the revision exists on GitHub, so a development
+    version from hatch-vcs (`0.1.devN+g<hash>[.dYYYYMMDD]`) gives the commit hash
+    and a release version `X.Y.Z` gives the tag `vX.Y.Z`.
+
+    Parameters
+    ----------
+    version : str, optional
+        Package version; defaults to the installed `__version__`.
+
+    Returns
+    -------
+    str
+        `https://github.com/leifdenby/mlcast-verification-tools@<revision>`
+    """
+    if version is None:
+        from . import __version__ as version
+    _, _, local = version.partition("+")
+    commit = next((p[1:] for p in local.split(".") if p.startswith("g")), None)
+    return f"{REPOSITORY_URL}@{commit or 'v' + version}"
 
 
 def _validator_version() -> str:
@@ -50,8 +77,8 @@ def add_global_attrs(
     title: str,
     forecasts: str,
     truth: str,
-    created_by: str,
-    created_with: str,
+    created_by: str | None = None,
+    created_with: str | None = None,
     license: str = "CC-BY-4.0",
     dataset_version: str = "0.1.0",
     created_on: str | None = None,
@@ -70,15 +97,13 @@ def add_global_attrs(
     truth : str
         Description of the truth source the forecasts are verified against
         (`truth`, §5.1).
-    created_by : str
-        Creator contact in `Name <email>` format (`mlcast_created_by`, §5.4).
-    created_with : str
-        GitHub URL with `@version` of the repository that created the dataset
-        (`mlcast_created_with`, §5.4), e.g.
-        `https://github.com/mlcast-community/mlcast-dataset-dmi-nowcast-scores@v0.1.0`.
-        The spec requires the repository to be named
-        `mlcast-dataset-{organisation_id}-{dataset_name}`, so this is the repository
-        of the score dataset, not of mlcast-verification-tools.
+    created_by : str, optional
+        Creator contact in `Name <email>` format (`mlcast_created_by`, §5.4,
+        optional in the spec). Omitted by default.
+    created_with : str, optional
+        GitHub URL with `@revision` of the software that created the dataset
+        (`mlcast_created_with`, §5.4, optional in the spec). Defaults to this
+        package's repository and revision, see `default_created_with`.
     license : str, optional
         SPDX license identifier (`license`, §5.2).
     dataset_version : str, optional
@@ -102,12 +127,13 @@ def add_global_attrs(
             "truth": truth,
             "license": license,
             "mlcast_created_on": created_on,
-            "mlcast_created_by": created_by,
-            "mlcast_created_with": created_with,
+            "mlcast_created_with": created_with or default_created_with(),
             "mlcast_dataset_version": dataset_version,
             "mlcast_dataset_validator_version": _validator_version(),
         }
     )
+    if created_by is not None:
+        ds.attrs["mlcast_created_by"] = created_by
     return ds
 
 

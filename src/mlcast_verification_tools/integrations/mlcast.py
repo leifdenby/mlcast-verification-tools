@@ -209,12 +209,13 @@ def add_run_mlcast_arguments(parser: argparse.ArgumentParser) -> None:
     g.add_argument("--no-psd", action="store_true", help="skip the radial power spectra")
     g.add_argument("--no-progress", action="store_true")
     g.add_argument("--title", help="title of the score dataset (default: generated)")
-    g.add_argument("--created-by", required=True, help="'Name <email>'")
+    g.add_argument(
+        "--created-by", help="creator contact 'Name <email>' (optional; default: omitted)"
+    )
     g.add_argument(
         "--created-with",
-        required=True,
-        help="GitHub URL@version of the score dataset repo, e.g. "
-        "https://github.com/mlcast-community/mlcast-dataset-dmi-nowcast-scores@v0.1.0",
+        help="GitHub URL@revision of the creating software "
+        "(optional; default: this tool's repository@revision)",
     )
     g.add_argument("--forecasts", help="description of the forecasts (default: generated)")
     g.add_argument("--truth", help="description of the truth (default: from the source attrs)")

@@ -89,8 +89,6 @@ scores = compute_scores({"irene": fc_irene, "steps": fc_steps}, radar)  # GPU if
 path = write_scores(
     scores, "scores.zarr",
     title="...", forecasts="...", truth="...",
-    created_by="Name <email>",
-    created_with="https://github.com/<org>/mlcast-dataset-<org>-<name>@v0.1.0",
 )
 validate_scores(path).console_print()
 plot_all(scores, "figures/")
@@ -106,9 +104,7 @@ pass `--data-root`, or `--zarr-path`/`--index-path`:
 ```bash
 mlcast.verify run-mlcast \
     --checkpoint logs/mlcast/version_3/checkpoints/best.ckpt \
-    --out scores.zarr \
-    --created-by "Name <email>" \
-    --created-with https://github.com/<org>/mlcast-dataset-<org>-<name>@v0.1.0
+    --out scores.zarr
 mlcast.verify plot scores.zarr --out figures/
 ```
 
@@ -145,9 +141,10 @@ uv run --extra cpu python examples/synthetic_demo.py --out demo_output
 - **`init_time` must be unique per source**, so verification uses a fixed domain per
   initialisation time (not random crops).
 - **Ensemble sizes may differ** between sources; `rank` is NaN-padded to the largest K+1.
-- **`mlcast_created_with`** must point to a repository named
-  `mlcast-dataset-{organisation_id}-{dataset_name}` (validator §5.4), i.e. the repository
-  of the score dataset, so `write_scores` requires it explicitly.
+- **Provenance.** `mlcast_created_by` and `mlcast_created_with` are optional in the
+  spec (§5.4). `write_scores` records this package's repository and revision in
+  `mlcast_created_with` by default, and adds `mlcast_created_by` only when given
+  (`created_by=` / `--created-by "Name <email>"`).
 - The spec's polarity classes have no natural fit for a distribution such as the rank
   histogram; `neutral` is used until the spec gains e.g. a `distribution` class.
 

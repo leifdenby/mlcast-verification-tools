@@ -70,8 +70,6 @@ def main() -> None:
         title=f"Verification scores of {source}",
         forecasts=f"{source}: {args.ensemble_size}-member mlcast ConvGRU ensemble, test split",
         truth="mlcast source data of the run, converted to mm/h",
-        created_by="Your Name <you@example.com>",
-        created_with="https://github.com/mlcast-community/mlcast-dataset-dmi-nowcast-scores@v0.1.0",
     )
     print(f"wrote scores of {scores.sizes['init_time']} cases to {args.out}")
 

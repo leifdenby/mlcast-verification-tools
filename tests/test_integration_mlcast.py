@@ -618,9 +618,6 @@ def test_load_mlcast_model(tmp_path):
     assert_same_weights(mi.load_mlcast_model(ckpt))
 
 
-CREATED_WITH = "https://github.com/mlcast-community/mlcast-dataset-xx-test-scores@v0.1.0"
-
-
 @pytest.fixture
 def offline_metadata(monkeypatch):
     """Skip the validator's GitHub lookups of `mlcast_created_with` (as in test_io)."""
@@ -655,8 +652,6 @@ def test_verify_mlcast_run(data_root, run_dir, tmp_path, offline_metadata):
         title="test scores",
         forecasts="tiny ConvGRU",
         truth="synthetic radar",
-        created_by="Test <test@example.com>",
-        created_with=CREATED_WITH,
     )
     report = validate_scores(path)
     assert not report.has_fails(), [r for r in report.results if r.status == "FAIL"]
@@ -675,8 +670,6 @@ def test_run_mlcast_cli(data_root, run_dir, monkeypatch):
         "run-mlcast",
         "--checkpoint", str(run_dir / "checkpoints" / "epoch=0-step=1.ckpt"),
         "--out", str(out),
-        "--created-by", "Test <test@example.com>",
-        "--created-with", CREATED_WITH,
         "--ensemble-size", "3",
         "--max-cases", "4",
         "--device", "cpu",
@@ -691,7 +684,11 @@ def test_run_mlcast_cli(data_root, run_dir, monkeypatch):
     assert "version_0" in scores.attrs["title"] and "test split" in scores.attrs["title"]
     assert "XX-TEST v0.1.0" in scores.attrs["truth"]
     assert "init times of the test split" in scores.attrs["forecasts"]
-    assert scores.attrs["mlcast_created_with"].endswith("@v0.1.0")
+    # provenance is optional: this tool's repository@revision, no creator contact
+    assert scores.attrs["mlcast_created_with"].startswith(
+        "https://github.com/leifdenby/mlcast-verification-tools@"
+    )
+    assert "mlcast_created_by" not in scores.attrs
 
     # the arguments the config provides are gone
     parser = argparse.ArgumentParser()
