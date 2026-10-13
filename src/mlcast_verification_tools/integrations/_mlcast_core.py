@@ -640,7 +640,7 @@ class VerificationDataset(Dataset):
     storage_options : dict, optional
         Passed to ``xr.open_zarr`` when `source` is a path/URL.
     crops : pd.DataFrame, optional
-        Crop mode: forecast and score each crop on its own instead of the domain.
+        Crop mode: the domain is still forecast, but only these crops of it are scored.
         Columns ``init_time``, ``y`` and ``x`` (indices of the crop's first row/column),
         e.g. from :func:`split_crops`. Crops at init times that are not requested or
         lack frames are dropped. Not combinable with `region`.
@@ -652,9 +652,9 @@ class VerificationDataset(Dataset):
     Items are dicts with ``input`` (T_in, 1, H, W) float32 normalised, ``target``
     (T_out, H, W) float32 in the source units with NaN kept, ``mask`` (H, W) bool and
     ``init_time`` (int64 ns since the epoch, so it collates into a tensor). In crop mode
-    an item is still a full-domain case (the frames are read once per init time), with
-    ``crops`` (N, 2) int64 holding the ``(y, x)`` corners of its N crops; the forecast
-    loop cuts the crops out and runs the model on each.
+    an item is still a full-domain case, with ``crops`` (N, 2) int64 holding the
+    ``(y, x)`` corners of its N crops; the forecast loop cuts the crops out of the
+    full-domain forecast and observation.
     """
 
     def __init__(
@@ -772,7 +772,7 @@ class VerificationDataset(Dataset):
         ``standard_names``), ``input_steps`` and ``forecast_steps`` come from the
         run's ``data.dataset_factory``; the init times are those of the crops mlcast
         selects for the split (:func:`split_crops`). By default each init time is
-        forecast over the full domain; with `crops`, each crop is forecast on its own.
+        forecast over the full domain; with `crops`, only the crops are scored.
 
         Parameters
         ----------
@@ -790,8 +790,8 @@ class VerificationDataset(Dataset):
         region : dict, optional
             Fixed sub-domain, see the class parameters. Default: full domain.
         crops : bool
-            Crop mode: forecast and score each of the split's crops on its own, as
-            mlcast's test step does (see the class parameters).
+            Crop mode: score only the split's crops, cut out of the full-domain
+            forecasts (see the class parameters).
         max_crops : int, optional
             Crop mode: keep at most this many crops, evenly spread over the crops of
             the (possibly `max_cases`-subsampled) init times (deterministic).
@@ -946,9 +946,14 @@ class VerificationDataset(Dataset):
 
     @property
     def grid_shape(self) -> tuple[int, int]:
-        """``(H, W)`` of the verification domain (region applied), or of the crops."""
+        """``(H, W)`` of the scored fields: the crops in crop mode, else the domain."""
         if self.crop_size is not None:
             return self.crop_size
+        return self.domain_shape
+
+    @property
+    def domain_shape(self) -> tuple[int, int]:
+        """``(H, W)`` of the forecast domain (region applied)."""
         shape = []
         for name, dim in (("y", self.y_dim), ("x", self.x_dim)):
             size = self.ds.sizes[dim]
@@ -1120,16 +1125,16 @@ def verify_mlcast_model(
         ``(B, T_in, 1, H, W)``, returning ``(B, T, M, H, W)`` normalised (members on
         dim 2). Moved to `device` and set to eval mode.
     dataset : VerificationDataset
-        Cases to score. In crop mode (``crops=``) each crop is forecast on its own and
-        the scores of the crops of an init time are pooled: MAE, CRPS and the rank
+        Cases to score. In crop mode (``crops=``) the full domain is forecast and its
+        crops are cut out of the forecast and scored; the scores of the crops of an
+        init time are pooled: MAE, CRPS and the rank
         histogram over all their valid pixels, the power spectra averaged over crops.
     forecast_source : str
         Name of the forecast source in the score dataset.
     ensemble_size : int
         Number of members M.
     batch_size : int
-        Cases per batch; in crop mode, crops per model call (one init time is read
-        at a time).
+        Cases per batch.
     device : str or torch.device, optional
         Default ``"cuda"`` if available, else ``"cpu"``.
     num_workers : int
@@ -1237,17 +1242,18 @@ def _iter_forecasts(
     model = model.to(device).eval()
     chunks = _member_chunks(ensemble_size, member_chunk)
     scaling = dataset.scaling
-    # crop mode: one init time per loader item (its frames are read once), `batch_size`
-    # crops per model call
+    # crop mode: the full domain is forecast, the crops are cut out of the forecast
     crop_mode = dataset.crop_size is not None
     worker_kwargs: dict[str, Any] = {}
     if num_workers > 0:
         # Forked workers can deadlock once the parent has started threads (zarr/xarray
         # I/O, torch); spawned workers start clean and reopen the source themselves.
         worker_kwargs = {"multiprocessing_context": "spawn", "persistent_workers": False}
+    if crop_mode:
+        worker_kwargs["collate_fn"] = _collate_with_crops
     loader = DataLoader(
         dataset,
-        batch_size=1 if crop_mode else batch_size,
+        batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=device.type == "cuda",
@@ -1271,8 +1277,7 @@ def _iter_forecasts(
         try:
             from tqdm.auto import tqdm
 
-            unit = "init time" if crop_mode else "batch"
-            batches = bar = tqdm(loader, desc=desc, unit=unit)
+            batches = bar = tqdm(loader, desc=desc, unit="batch")
         except ImportError:  # pragma: no cover
             pass
     timer = _StageTimer(device, ("data", "model", consumer)) if bar is not None else None
@@ -1289,25 +1294,24 @@ def _iter_forecasts(
             obs = batch["target"].to(device, non_blocking=True)
             obs = torch.nan_to_num(obs, nan=0.0)  # NaN obs are outside `mask`
             init_times = batch["init_time"].numpy().astype("datetime64[ns]")
-            if crop_mode:
-                pieces = _crop_pieces(
-                    x, obs, mask, init_times, batch["crops"][0], dataset.crop_size, batch_size
-                )
-            else:
-                pieces = iter([(x, obs, mask, init_times)])
-            del x, obs, mask
-        for x, obs, mask, init_times in pieces:
-            with torch.inference_mode():
-                preds = _forecast(model, x, dataset.forecast_steps, chunks, precision)
-                preds = preds.clamp_(scaling.norm_min, scaling.norm_max)
-                preds = denormalize_torch(preds, dataset.standard_name, scaling)
-                del x
-            if timer:
-                timer.lap("model")
-            yield preds, obs, mask, init_times
-            del preds, obs, mask
+
+            preds = _forecast(model, x, dataset.forecast_steps, chunks, precision)
+            preds = preds.clamp_(scaling.norm_min, scaling.norm_max)
+            preds = denormalize_torch(preds, dataset.standard_name, scaling)
+            del x
+        if timer:
+            timer.lap("model")
+        if crop_mode:
+            pieces = _crop_pieces(preds, obs, mask, init_times, batch["crops"], dataset.crop_size)
+        else:
+            pieces = iter([(preds, obs, mask, init_times)])
+        del preds, obs, mask
+        for piece in pieces:
+            yield piece
+            del piece
             if timer:
                 timer.lap(consumer)
+        del pieces
         if timer:
             timer.end_batch()
             bar.set_postfix_str(timer.summary(), refresh=False)
@@ -1319,7 +1323,7 @@ def _iter_forecasts(
         f" ({dataset.n_crops} crops)" if crop_mode else "",
         datetime.timedelta(seconds=round(elapsed)),
         elapsed / len(dataset),
-        f"; per {'init time' if crop_mode else 'batch'}: {timer.summary()}" if timer else "",
+        f"; per batch: {timer.summary()}" if timer else "",
     )
 
 
@@ -1355,13 +1359,12 @@ def _print_summary(
     from rich.panel import Panel
     from rich.table import Table
 
-    h, w = dataset.grid_shape
+    h, w = dataset.domain_shape
     first, last = (pd.Timestamp(t) for t in dataset.init_times[[0, -1]])
     skipped = len(dataset.skipped_init_times)
     lead_times = pd.to_timedelta(dataset.lead_times)
     n_cases = len(dataset)
     crop_mode = dataset.crop_size is not None
-    n_fields = dataset.n_crops  # forecast fields per member and lead time
     calls = (
         "1 model call per batch"
         if len(chunks) == 1
@@ -1389,10 +1392,12 @@ def _print_summary(
         + (f", {skipped:,} skipped (missing frames)" if skipped else ""),
     )
     if crop_mode:
+        ch, cw = dataset.crop_size
+        n_crops = dataset.n_crops
         grid.add_row(
             "Crops",
-            f"✂️   {n_fields:,} crops, {n_fields / n_cases:.1f} per init time on average   "
-            "scores pooled per init time",
+            f"✂️   {n_crops:,} crops of {ch:,} × {cw:,} px, {n_crops / n_cases:.1f} per init "
+            "time on average   cut from the forecasts, scores pooled per init time",
         )
     grid.add_row(
         "Steps",
@@ -1402,17 +1407,14 @@ def _print_summary(
     )
     grid.add_row("Model", f"🧠  {_describe_model(model)}")
     grid.add_row("Ensemble", f"🎲  {ensemble_size} members   {calls}")
-    unit = "crops" if crop_mode else "cases"
     grid.add_row(
         "Workload",
-        f"🧮  {n_fields:,} {unit} × {ensemble_size} members × {dataset.forecast_steps} steps"
-        f" = {n_fields * ensemble_size * dataset.forecast_steps:,} fields of {h:,} × {w:,}",
+        f"🧮  {n_cases:,} cases × {ensemble_size} members × {dataset.forecast_steps} steps"
+        f" = {n_cases * ensemble_size * dataset.forecast_steps:,} fields of {h:,} × {w:,}",
     )
-    if crop_mode:
-        batches = f"📦  {n_batches:,} init times   ≤ {batch_size} crops per model call"
-    else:
-        batches = f"📦  {n_batches:,} × {batch_size} cases"
-    grid.add_row("Batches", f"{batches}   {num_workers} loader workers")
+    grid.add_row(
+        "Batches", f"📦  {n_batches:,} × {batch_size} cases   {num_workers} loader workers"
+    )
     grid.add_row(
         "Device",
         f"⚡  {device_label}   {'bfloat16 autocast' if precision == 'bf16' else 'float32'}",
@@ -1428,30 +1430,49 @@ def _print_summary(
     )
 
 
+def _collate_with_crops(items: list[dict[str, torch.Tensor]]) -> dict[str, Any]:
+    """Default collation, except ``crops``: a list (the cases have different numbers)."""
+    from torch.utils.data import default_collate
+
+    crops = [item.pop("crops") for item in items]
+    batch = default_collate(items)
+    batch["crops"] = crops
+    return batch
+
+
+# elements of the crop forecasts scored at once, (crops, T, M, h, w): bounds the memory of
+# the stacked crops and the score temporaries (1 GiB of float32)
+_CROP_CHUNK_ELEMENTS = 2**28
+
+
 def _crop_pieces(
-    x: torch.Tensor,
+    preds: torch.Tensor,
     obs: torch.Tensor,
     mask: torch.Tensor,
     init_times: np.ndarray,
-    corners: torch.Tensor,
+    corners: list[torch.Tensor],
     crop_size: tuple[int, int],
-    batch_size: int,
 ) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor, np.ndarray]]:
     """
-    Cut the crops of one full-domain case into batches of at most `batch_size` crops.
+    Cut the crops out of full-domain forecasts, in chunks of crops of one case.
 
-    `x` ``(1, T_in, 1, H, W)``, `obs` ``(1, T, H, W)`` and `mask` ``(1, H, W)`` are the
-    case's tensors, `corners` ``(N, 2)`` the ``(y, x)`` corners of its crops.
+    `preds` ``(B, T, M, H, W)``, `obs` ``(B, T, H, W)`` and `mask` ``(B, H, W)`` are the
+    batch's full-domain tensors, ``corners[b]`` ``(N_b, 2)`` the ``(y, x)`` corners of
+    the crops of case ``b``. Yields ``(n, T, M, h, w)``, ``(n, T, h, w)``, ``(n, h, w)``
+    and the case's init time repeated ``n`` times.
     """
     h, w = crop_size
-    corners = corners.tolist()
-    for start in range(0, len(corners), batch_size):
-        part = corners[start : start + batch_size]
+    _, t, m, _, _ = preds.shape
+    chunk = max(1, _CROP_CHUNK_ELEMENTS // (t * m * h * w))
+    for b, case_corners in enumerate(corners):
+        case_corners = case_corners.tolist()
+        for start in range(0, len(case_corners), chunk):
+            part = case_corners[start : start + chunk]
 
-        def cut(t: torch.Tensor, part=part) -> torch.Tensor:
-            return torch.stack([t[0, ..., y : y + h, x0 : x0 + w] for y, x0 in part])
+            def cut(tensor: torch.Tensor, part=part, b=b) -> torch.Tensor:
+                return torch.stack([tensor[b, ..., y : y + h, x : x + w] for y, x in part])
 
-        yield cut(x), cut(obs), cut(mask), np.repeat(init_times, len(part))
+            yield cut(preds), cut(obs), cut(mask), np.repeat(init_times[b : b + 1], len(part))
 
 
 class _StageTimer:
@@ -1577,7 +1598,7 @@ def _prepare_run(
 
 def _describe_domain(dataset: VerificationDataset) -> str:
     if dataset.crop_size is not None:
-        return "crops of the split, each forecast on its own"
+        return "full domain, scored on the split's crops"
     if not dataset.region:
         return "full domain"
     return "sub-domain " + ", ".join(
@@ -1593,8 +1614,8 @@ def _describe_forecasts(run: _Run, ensemble_size: int, precision: str = "fp32") 
     if dataset.crop_size is not None:
         h, w = dataset.crop_size
         domain = (
-            f"each of {dataset.n_crops} sampled {h}x{w} crops forecast on its own (scores "
-            f"pooled per init time)"
+            f"full domain scored on the {dataset.n_crops} sampled {h}x{w} crops cut out of "
+            "the forecasts (scores pooled per init time)"
         )
     else:
         domain = _describe_domain(dataset)
@@ -1909,7 +1930,7 @@ def verify_mlcast_run(
     the model from `checkpoint` (:func:`load_mlcast_model`), builds the cases
     (:meth:`VerificationDataset.from_mlcast_config`: the unique init times of the
     crops mlcast samples for the split, forecast over the full domain, or with
-    `crops` each crop forecast on its own) and scores them on the fly
+    `crops` scoring only the crops) and scores them on the fly
     (:func:`verify_mlcast_model`); forecasts are never stored. Over the full domain
     the same as ``compute_scores(forecast_mlcast(config, checkpoint, ...),
     open_truth(config))`` with the same arguments.
@@ -1941,10 +1962,10 @@ def verify_mlcast_run(
     region : dict, optional
         Fixed sub-domain instead of the full domain, see :class:`VerificationDataset`.
     crops : bool
-        Forecast and score each crop the sampler selects for the split on its own, as
-        mlcast's test step does, instead of the full domain; the scores of the crops
-        of an init time are pooled (see :func:`verify_mlcast_model`). `batch_size` is
-        then the number of crops per model call.
+        Score only the crops the sampler selects for the split, cut out of the
+        full-domain forecasts, instead of the full domain; the scores of the crops of
+        an init time are pooled (see :func:`verify_mlcast_model`). Same model cost as
+        the full-domain run.
     max_crops : int, optional
         With `crops`, evenly subsample the crops to at most this many (after
         `max_cases`).

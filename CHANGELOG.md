@@ -24,9 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `verify-trained-model --crops` (`verify_mlcast_run(crops=True)`,
-  `VerificationDataset(crops=, crop_size=)`): forecast each crop the sampler selects for
-  the split on its own, as mlcast's test step does, instead of the full domain, with the
-  scores of the crops of an init time pooled (`ScoreAccumulator(pool_by_init_time=True)`);
+  `VerificationDataset(crops=, crop_size=)`): score only the crops the sampler selects for
+  the split, cut out of the full-domain forecasts, with the scores of the crops of an
+  init time pooled (`ScoreAccumulator(pool_by_init_time=True)`);
   `--max-crops` subsamples the crops. `split_crops` returns the split's crops.
 - `--precision bf16` for `verify-trained-model` / `forecast-trained-model` (`precision=`
   in `verify_mlcast_model`, `verify_mlcast_run` and `forecast_mlcast`): runs the model

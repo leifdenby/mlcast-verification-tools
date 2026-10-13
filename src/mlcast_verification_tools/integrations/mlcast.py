@@ -38,9 +38,9 @@ Pipeline
    init times from the source Zarr, normalised exactly as mlcast's training
    datasets do. The :class:`VerificationDataset` constructor also takes an explicit
    source and init times (e.g. :func:`init_times_from_range`). With ``crops=True``
-   (``--crops``) each crop of the split (:func:`split_crops`) is instead forecast on
-   its own, as mlcast's test step does, and the scores of the crops of an init time
-   are pooled (on-the-fly scoring only).
+   (``--crops``) only the crops of the split (:func:`split_crops`) are scored, cut
+   out of the full-domain forecasts, and the scores of the crops of an init time are
+   pooled (on-the-fly scoring only).
 4. The model is run, clamped to the normalised range (as
    ``NowcastLightningModule.shared_step`` does) and de-normalised on the device with
    :func:`denormalize_torch`; :func:`verify_mlcast_model` accumulates the scores,
@@ -280,9 +280,9 @@ def build_verify_trained_model_parser(
     g.add_argument(
         "--crops",
         action="store_true",
-        help="forecast and score each crop the sampler selects for the split on its own, "
-        "as mlcast's test step does; the scores of the crops of an init time are pooled. "
-        "--batch-size is then the number of crops per model call",
+        help="score only the crops the sampler selects for the split, cut out of the "
+        "full-domain forecasts (same model cost as the full-domain run); the scores of the "
+        "crops of an init time are pooled",
     )
     g.add_argument(
         "--max-crops",

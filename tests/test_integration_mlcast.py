@@ -848,22 +848,50 @@ class PersistenceModel(torch.nn.Module):
 _CROP_KWARGS = {"forecast_source": "convgru", "device": "cpu", "progress": False}
 
 
-def test_verify_crops_equal_region(source_path):
-    """One crop per init time, all at one corner, == that corner as a fixed region."""
+def test_verify_crops_whole_grid_equals_full_domain(source_path):
+    """One crop covering the grid per init time == the full-domain run (same forecasts)."""
     init_times = _valid_init_times(3)
-    crops = pd.DataFrame({"init_time": init_times, "y": 4, "x": 8})
+    crops = pd.DataFrame({"init_time": init_times, "y": 0, "x": 0})
     by_crop = mi.VerificationDataset(
-        source_path, None, INPUT_STEPS, FORECAST_STEPS, crops=crops, crop_size=(8, 8)
+        source_path, None, INPUT_STEPS, FORECAST_STEPS, crops=crops, crop_size=(NY, NX)
     )
-    by_region = mi.VerificationDataset(
-        source_path, init_times, INPUT_STEPS, FORECAST_STEPS,
-        region={"y": slice(4, 12), "x": slice(8, 16)},
-    )  # fmt: skip
-    kwargs = {**_CROP_KWARGS, "ensemble_size": 3, "batch_size": 1}
+    full = mi.VerificationDataset(source_path, init_times, INPUT_STEPS, FORECAST_STEPS)
+    kwargs = {**_CROP_KWARGS, "ensemble_size": 3, "batch_size": 2}
     xr.testing.assert_allclose(
         mi.verify_mlcast_model(AdapterModel(), by_crop, **kwargs),
-        mi.verify_mlcast_model(AdapterModel(), by_region, **kwargs),
+        mi.verify_mlcast_model(AdapterModel(), full, **kwargs),
     )
+
+
+def test_verify_crops_forecast_full_domain_once(source_path, monkeypatch):
+    """Crops are cut out of one full-domain forecast per batch, not forecast themselves."""
+    init_times = _valid_init_times(3)
+    crops = pd.DataFrame(
+        [(t, y, x) for t in init_times for y, x in [(0, 0), (8, 4), (16, 12)]],
+        columns=["init_time", "y", "x"],
+    )
+    ds = mi.VerificationDataset(
+        source_path, None, INPUT_STEPS, FORECAST_STEPS, crops=crops, crop_size=(8, 8)
+    )
+    shapes = []
+
+    class Recording(PersistenceModel):
+        def forward(self, x, forecast_steps, ensemble_size=None):
+            shapes.append(tuple(x.shape))
+            return super().forward(x, forecast_steps, ensemble_size)
+
+    scores = mi.verify_mlcast_model(Recording(), ds, ensemble_size=2, batch_size=2, **_CROP_KWARGS)
+    assert shapes == [(2, INPUT_STEPS, 1, NY, NX), (1, INPUT_STEPS, 1, NY, NX)]
+    _check_scores(scores, 3, 2)
+
+    # scoring the crops one at a time (small chunks) gives the same pooled scores
+    from mlcast_verification_tools.integrations import _mlcast_core
+
+    monkeypatch.setattr(_mlcast_core, "_CROP_CHUNK_ELEMENTS", 1)
+    one_by_one = mi.verify_mlcast_model(
+        PersistenceModel(), ds, ensemble_size=2, batch_size=2, **_CROP_KWARGS
+    )
+    xr.testing.assert_allclose(one_by_one, scores)
 
 
 def test_verify_crops_pooled(source_path):
@@ -1249,7 +1277,7 @@ def test_verify_trained_model_cli_crops(data_root, run_dir, monkeypatch):
     scores = open_scores(out).load()
     _check_scores(scores, scores.sizes[cv.INIT_TIME], 3)
     assert scores.sizes["wavelength"] == 4
-    assert "each of 6 sampled 8x8 crops forecast on its own" in scores.attrs["forecasts"]
+    assert "full domain scored on the 6 sampled 8x8 crops" in scores.attrs["forecasts"]
 
     with pytest.raises(SystemExit, match="--region"):
         main([*argv[:-2], "--region-y", "0:8", "--out", str(out)])

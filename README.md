@@ -162,16 +162,15 @@ the window. Several crops at the same time give one case. Each case is then fore
 the **full radar domain** (or a fixed `--region-y/--region-x`), because a score file
 holds one value per source, init time and lead time.
 
-With **`--crops`**, `verify-trained-model` instead forecasts **each test crop on its own**,
-exactly as mlcast's test step sees it (e.g. 256×256 pixels, without the context of the
-surrounding domain), and pools the scores of the crops of an init time: MAE, CRPS and the
-rank histogram over all their valid pixels (overlapping crops count their pixels once per
-crop, as in training), the power spectra averaged over the crops (so the wavelengths are
-those of a crop). The frames of an init time are still read once; `--batch-size` is the
-number of crops per model call. The test split can hold hundreds of overlapping crops per
-init time, so this can cost several times the full-domain run: subsample with
-`--max-cases` (init times) and `--max-crops` (crops). Forecasts of crops cannot be stored,
-so `forecast-trained-model` has no `--crops`.
+With **`--crops`**, `verify-trained-model` still forecasts the full domain at each init
+time but **scores only the test crops** (e.g. 256×256 pixels), cut out of the forecast and
+the observation, and pools the scores of the crops of an init time: MAE, CRPS and the rank
+histogram over all their valid pixels (overlapping crops count their pixels once per crop,
+as in training), the power spectra averaged over the crops (so the wavelengths are those
+of a crop). The model cost is that of the full-domain run; unlike mlcast's test step, the
+model sees the domain around each crop. `--max-crops` subsamples the crops. Scores of
+crops cannot be computed from stored forecasts, so `forecast-trained-model` has no
+`--crops`.
 
 Before the first batch a summary panel shows what is verified (source, domain, init
 times, steps, model, ensemble, workload, batching, device), and the progress bar shows the mean time per batch spent
