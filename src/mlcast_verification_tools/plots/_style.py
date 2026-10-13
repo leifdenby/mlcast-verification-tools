@@ -201,6 +201,7 @@ def axis_label(da: xr.DataArray, fallback: str) -> str:
     units = da.attrs.get("units")
     if units and units != "1":
         units = units.replace("mm h-1", "mm/h").replace("h-2", "h⁻²").replace("mm2", "mm²")
+        units = units.replace("dBZ2", "dBZ²")
         return f"{name} [{units}]"
     return name
 

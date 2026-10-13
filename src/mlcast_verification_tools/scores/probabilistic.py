@@ -50,7 +50,8 @@ def rank_histogram(
     """
     Relative frequency of the observation's rank among the K members, per case.
 
-    Values below ``zero_threshold`` are set to 0 in forecast and observation. The rank
+    Values below ``zero_threshold`` count as zero: in forecast and observation they are
+    tied with each other and ranked below all other values, in any units. The rank
     is ``1 + #{x_k < y} + floor(U (1 + #{x_k == y}))`` with ``U ~ Uniform[0, 1)``,
     so ties are broken at random.
 
@@ -63,7 +64,8 @@ def rank_histogram(
     mask : torch.Tensor
         Boolean ``(B, H, W)`` or ``(B, T, H, W)``, True = valid pixel.
     zero_threshold : float
-        Rain rate (mm/h) below which values count as zero.
+        Value (in the units of ``fc`` and ``obs``) below which values count as zero,
+        e.g. 0.037 for rain rates in mm/h (IRENE paper).
     generator : torch.Generator, optional
         Random generator on the device of ``fc``.
 
@@ -74,7 +76,8 @@ def rank_histogram(
     """
     mask = expand_mask(mask, obs)
     b, t, k = fc.shape[:3]
-    zero = torch.zeros((), dtype=fc.dtype, device=fc.device)
+    # -inf rather than 0 so that "zero" is below every value in any units (e.g. dBZ)
+    zero = torch.full((), float("-inf"), dtype=fc.dtype, device=fc.device)
     fc = torch.where(fc < zero_threshold, zero, fc)
     obs = torch.where(obs < zero_threshold, zero, obs)[:, :, None]
     n_below = (fc < obs).sum(dim=2)

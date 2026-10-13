@@ -26,8 +26,15 @@ class ScoreAccumulator:
         the length of the T dim of the forecasts passed to :meth:`update`.
     dx_km : float
         Grid spacing in km (for the radial PSD).
+    variable : str
+        Short name of the verified variable, used in the score names
+        ``{metric}.{variable}``, e.g. ``"tp"`` or ``"dbz"``.
+    units : str
+        Units of the forecasts and observations (scores are computed in these units,
+        without conversion), e.g. ``"mm h-1"`` or ``"dBZ"``.
     zero_threshold : float
-        Rain rate (mm/h) below which values count as zero in the rank histogram.
+        Value (in `units`) below which values count as zero in the rank histogram; see
+        :func:`.units.default_zero_threshold`.
     seed : int
         Seed of the random generator used to break ties in the rank histogram.
     compute_psd : bool
@@ -40,6 +47,8 @@ class ScoreAccumulator:
         lead_times,
         dx_km: float,
         *,
+        variable: str = cv.VARIABLE,
+        units: str = "mm h-1",
         zero_threshold: float = cv.RANK_ZERO_THRESHOLD_MM_H,
         seed: int = 0,
         compute_psd: bool = True,
@@ -47,6 +56,8 @@ class ScoreAccumulator:
         self.forecast_source = str(forecast_source)
         self.lead_times = pd.to_timedelta(np.asarray(lead_times)).values.astype("timedelta64[ns]")
         self.dx_km = float(dx_km)
+        self.variable = str(variable)
+        self.units = str(units)
         self.zero_threshold = zero_threshold
         self.seed = seed
         self.compute_psd = compute_psd
@@ -76,9 +87,9 @@ class ScoreAccumulator:
         Parameters
         ----------
         fc : torch.Tensor
-            Forecast ``(B, T, M, H, W)`` in mm/h, on any device.
+            Forecast ``(B, T, M, H, W)`` in `units`, on any device.
         obs : torch.Tensor
-            Observation ``(B, T, H, W)`` in mm/h.
+            Observation ``(B, T, H, W)`` in `units`.
         mask : torch.Tensor
             Boolean ``(B, H, W)`` or ``(B, T, H, W)``, True = valid pixel.
         init_times : sequence of datetime-like
@@ -135,13 +146,18 @@ class ScoreAccumulator:
             return np.concatenate(self._results[metric])[order][None].astype(np.float64)
 
         case_dims = cv.CASE_DIMS
+        attrs = cv.metric_attrs(self.units)
+
+        def name(metric: str) -> str:
+            return cv.var_name(metric, self.variable)
+
         data_vars = {
-            cv.var_name(cv.MAE): (case_dims, stacked(cv.MAE), cv.METRIC_ATTRS[cv.MAE]),
-            cv.var_name(cv.CRPS): (case_dims, stacked(cv.CRPS), cv.METRIC_ATTRS[cv.CRPS]),
-            cv.var_name(cv.RANK_HISTOGRAM): (
+            name(cv.MAE): (case_dims, stacked(cv.MAE), attrs[cv.MAE]),
+            name(cv.CRPS): (case_dims, stacked(cv.CRPS), attrs[cv.CRPS]),
+            name(cv.RANK_HISTOGRAM): (
                 (*case_dims, cv.RANK),
                 stacked(cv.RANK_HISTOGRAM),
-                cv.METRIC_ATTRS[cv.RANK_HISTOGRAM],
+                attrs[cv.RANK_HISTOGRAM],
             ),
         }
         coords = {
@@ -152,10 +168,10 @@ class ScoreAccumulator:
         }
         if self.compute_psd:
             for metric in (cv.PSD, cv.PSD_OBS):
-                data_vars[cv.var_name(metric)] = (
+                data_vars[name(metric)] = (
                     (*case_dims, cv.WAVELENGTH),
                     stacked(metric),
-                    cv.METRIC_ATTRS[metric],
+                    attrs[metric],
                 )
             wavelength = psd_wavelengths(*self._grid_shape, self.dx_km).numpy()
             coords[cv.WAVELENGTH] = (cv.WAVELENGTH, wavelength, cv.COORD_ATTRS[cv.WAVELENGTH])
@@ -168,6 +184,7 @@ def merge_sources(datasets: Sequence[xr.Dataset]) -> xr.Dataset:
 
     Uses an outer join: `rank` is NaN-padded to the largest ensemble size, and scores
     are NaN where init times, lead times or wavelengths of the sources do not overlap.
+    Scores of the same variable must have the same units in every dataset.
 
     Parameters
     ----------
@@ -184,6 +201,12 @@ def merge_sources(datasets: Sequence[xr.Dataset]) -> xr.Dataset:
     sources = np.concatenate([ds[cv.FORECAST_SOURCE].values for ds in datasets])
     if len(np.unique(sources)) != len(sources):
         raise ValueError(f"duplicate forecast_source among datasets: {list(sources)}")
+    for name in {name for ds in datasets for name in ds.data_vars}:
+        units = {ds[name].attrs.get("units") for ds in datasets if name in ds}
+        if len(units) > 1:
+            raise ValueError(
+                f"{name!r} has different units in the datasets: {sorted(map(str, units))}"
+            )
     merged = xr.concat(
         list(datasets),
         dim=cv.FORECAST_SOURCE,

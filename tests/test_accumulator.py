@@ -23,8 +23,8 @@ def _batch(b, k, seed):
     return fc, obs, mask
 
 
-def _accumulate(source, k, init_times, batch_size=2):
-    acc = ScoreAccumulator(source, LEAD_TIMES, DX)
+def _accumulate(source, k, init_times, batch_size=2, **kwargs):
+    acc = ScoreAccumulator(source, LEAD_TIMES, DX, **kwargs)
     for start in range(0, len(init_times), batch_size):
         its = init_times[start : start + batch_size]
         acc.update(*_batch(len(its), k, seed=start), its)
@@ -64,6 +64,39 @@ def test_to_dataset_layout_matches_synthetic():
     for name in ref.data_vars:
         assert ds[name].shape == ref[name].shape
     np.testing.assert_allclose(ds[cv.var_name(cv.RANK_HISTOGRAM)].sum(cv.RANK), 1.0)
+
+
+def test_variable_and_units():
+    init_times = list(pd.date_range("2025-01-01", periods=2, freq="1D"))
+    ds = _accumulate("m", 3, init_times, variable="dbz", units="dBZ").to_dataset()
+    assert set(ds.data_vars) == {
+        "mae.dbz", "crps.dbz", "rank_histogram.dbz", "psd.dbz", "psd_obs.dbz"
+    }  # fmt: skip
+    assert ds["mae.dbz"].attrs == cv.metric_attrs("dBZ")[cv.MAE]
+    assert ds["crps.dbz"].attrs["units"] == "dBZ"
+    assert ds["psd_obs.dbz"].attrs["units"] == "dBZ2 km"
+    assert ds["rank_histogram.dbz"].attrs["units"] == "1"
+
+
+@pytest.mark.parametrize(
+    ("units", "expected"),
+    [
+        ("mm h-1", "mm2 h-2 km"),
+        ("kg m-2 s-1", "kg2 m-4 s-2 km"),
+        ("dBZ", "dBZ2 km"),
+        ("mm/h", "(mm/h)2 km"),
+    ],
+)
+def test_psd_units(units, expected):
+    assert cv.psd_units(units) == expected
+
+
+def test_merge_sources_rejects_mixed_units():
+    init_times = list(pd.date_range("2025-01-01", periods=2, freq="1D"))
+    a = _accumulate("a", 3, init_times).to_dataset()
+    b = _accumulate("b", 3, init_times, units="kg m-2 s-1").to_dataset()
+    with pytest.raises(ValueError, match="different units"):
+        merge_sources([a, b])
 
 
 def test_to_dataset_sorts_and_matches_kernel():

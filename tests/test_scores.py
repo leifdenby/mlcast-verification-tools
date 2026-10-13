@@ -95,6 +95,17 @@ def test_rank_histogram_ties_broken_randomly():
     torch.testing.assert_close(hist, torch.full((1, 1, k + 1), 1 / (k + 1)), atol=0.02, rtol=0)
 
 
+def test_rank_histogram_threshold_any_units():
+    """Sub-threshold values tie below all others, also for negative values (e.g. dBZ)."""
+    fc, obs, mask = _random_case(k=5)
+    gen = torch.Generator().manual_seed(2)
+    expected = rank_histogram(fc, obs, mask, zero_threshold=0.5, generator=gen)
+    # shifting all values and the threshold by the same amount does not change ranks
+    gen = torch.Generator().manual_seed(2)
+    shifted = rank_histogram(fc - 40, obs - 40, mask, zero_threshold=-39.5, generator=gen)
+    torch.testing.assert_close(shifted, expected)
+
+
 def test_rank_histogram_obs_above_all_members():
     fc, obs, mask = _random_case(k=5)
     hist = rank_histogram(fc, obs + 10, mask)
