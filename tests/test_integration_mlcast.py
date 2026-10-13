@@ -830,7 +830,10 @@ def test_verify_trained_model_cli(data_root, run_dir, monkeypatch):
     # the mlcast plugin entry point gives the same scores
     out2 = data_root / "scores2.nc"
     assert mi.verify_trained_model_main([*_cli_case_args(run_dir), "--out", str(out2)]) == 0
-    xr.testing.assert_identical(open_scores(out2).load(), scores)
+    scores2 = open_scores(out2).load()
+    # the two files are written at different times
+    scores2.attrs["mlcast_created_on"] = scores.attrs["mlcast_created_on"]
+    xr.testing.assert_identical(scores2, scores)
 
     # the arguments the config provides are gone, and the config is required
     parser = mi.build_verify_trained_model_parser()
