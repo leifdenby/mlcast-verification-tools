@@ -1,23 +1,34 @@
-"""Score an `mlcast <https://github.com/mlcast-community/mlcast>`_ model while it forecasts.
+"""Forecast with and score trained `mlcast <https://github.com/mlcast-community/mlcast>`_ models.
 
-Forecasts are generated batch by batch on the GPU (or CPU), converted to mm/h and
-passed straight to a :class:`~mlcast_verification_tools.accumulator.ScoreAccumulator`,
-so no forecast is ever written to disk. Only the per-case scores are kept.
+The training config of the run is always an explicit input (an ``fdl.Config`` from
+:func:`load_run_config`, or the path of the run's ``config.yaml``). Two paths:
+
+- forecasts first, then scores::
+
+      ds_forecasts = forecast_mlcast(config, checkpoint, ensemble_size=20, out="fc.zarr")
+      ds_truth = open_truth(config)
+      scores = compute_scores(ds_forecasts, ds_truth)  # mlcast_verification_tools.offline
+
+- on the fly, never storing forecasts: forecasts are generated batch by batch on the
+  GPU (or CPU), converted to mm/h and passed straight to a
+  :class:`~mlcast_verification_tools.accumulator.ScoreAccumulator`::
+
+      scores = verify_mlcast_run(config, checkpoint, ensemble_size=20)
+
+With the same arguments and seed, both give the same scores.
 
 Needs the ``mlcast`` extra (torch, pytorch-lightning, mlcast). Importing this module
-is cheap: the CLI helpers below have no heavy dependencies, and the torch/mlcast
-API (:func:`verify_mlcast_run`, :func:`load_mlcast_model`,
-:class:`VerificationDataset`, :func:`verify_mlcast_model`, ...) is imported on
-first access from :mod:`._mlcast_core`.
+is cheap: the command line helpers below have no heavy dependencies, and the
+torch/mlcast API (:func:`forecast_mlcast`, :func:`open_truth`,
+:func:`verify_mlcast_run`, :func:`load_mlcast_model`, :class:`VerificationDataset`,
+:func:`verify_mlcast_model`, ...) is imported on first access from
+:mod:`._mlcast_core`.
 
 Pipeline
 --------
-:func:`verify_mlcast_run` (and ``mlcast.verify run-mlcast``) needs only the
-checkpoint of a training run; everything else comes from the run's Fiddle
-``config.yaml`` (``<run>/config.yaml`` next to ``<run>/checkpoints/*.ckpt``):
-
 1. :func:`load_run_config` loads the config with mlcast's own
-   ``mlcast.config.load_yaml_config`` and resolves its relative data paths.
+   ``mlcast.config.load_yaml_config`` and resolves its relative data paths
+   (:func:`find_config_yaml` locates ``<run>/config.yaml`` for a checkpoint).
 2. :func:`load_mlcast_model` restores a ``NowcastLightningModule`` from the
    checkpoint. The network is not part of the checkpoint's hyper-parameters (see
    below), so it is rebuilt from ``pl_module.network`` of the config.
@@ -27,9 +38,17 @@ checkpoint of a training run; everything else comes from the run's Fiddle
    init times from the source Zarr, normalised exactly as mlcast's training
    datasets do. The :class:`VerificationDataset` constructor also takes an explicit
    source and init times (e.g. :func:`init_times_from_range`).
-4. :func:`verify_mlcast_model` runs the model, clamps to the normalised range (as
-   ``NowcastLightningModule.shared_step`` does), de-normalises on the device with
-   :func:`denormalize_torch` and accumulates the scores.
+4. The model is run, clamped to the normalised range (as
+   ``NowcastLightningModule.shared_step`` does) and de-normalised on the device with
+   :func:`denormalize_torch`; :func:`verify_mlcast_model` accumulates the scores,
+   :func:`forecast_mlcast` returns (or writes) the forecasts.
+
+Command line
+------------
+Two mlcast sub-commands (``mlcast verify-trained-model`` / ``mlcast
+forecast-trained-model``, registered under the ``mlcast.commands`` entry-point group,
+also available as ``mlcast.verify verify-trained-model`` / ``forecast-trained-model``):
+:func:`verify_trained_model_main` and :func:`forecast_trained_model_main`.
 
 Units
 -----
@@ -64,11 +83,12 @@ if TYPE_CHECKING:  # pragma: no cover - for type checkers/IDEs; imported lazily 
         VerificationDataset,
         denormalize_torch,
         find_config_yaml,
+        forecast_mlcast,
         init_times_from_range,
         load_mlcast_model,
         load_run_config,
         mm_per_hour_factor,
-        run_mlcast_from_args,
+        open_truth,
         split_init_times,
         verify_mlcast_model,
         verify_mlcast_run,
@@ -82,11 +102,12 @@ _LAZY = (
     "VerificationDataset",
     "denormalize_torch",
     "find_config_yaml",
+    "forecast_mlcast",
     "init_times_from_range",
     "load_mlcast_model",
     "load_run_config",
     "mm_per_hour_factor",
-    "run_mlcast_from_args",
+    "open_truth",
     "split_init_times",
     "verify_mlcast_model",
     "verify_mlcast_run",
@@ -94,15 +115,19 @@ _LAZY = (
 
 __all__ = [  # noqa: RUF022 - grouped: light helpers first, then the lazily imported API
     "SUPPORTED_STANDARD_NAMES",
-    "add_run_mlcast_arguments",
+    "build_forecast_trained_model_parser",
+    "build_verify_trained_model_parser",
+    "forecast_trained_model_main",
+    "verify_trained_model_main",
     "VerificationDataset",
     "denormalize_torch",
     "find_config_yaml",
+    "forecast_mlcast",
     "init_times_from_range",
     "load_mlcast_model",
     "load_run_config",
     "mm_per_hour_factor",
-    "run_mlcast_from_args",
+    "open_truth",
     "split_init_times",
     "verify_mlcast_model",
     "verify_mlcast_run",
@@ -124,6 +149,14 @@ def __dir__() -> list[str]:
     return sorted(set(globals()) | set(_LAZY))
 
 
+# ---------------------------------------------------------------------------
+# Command line (standard library only)
+# ---------------------------------------------------------------------------
+
+VERIFY_HELP = "score a trained mlcast model on its run's test split, without storing forecasts"
+FORECAST_HELP = "forecast with a trained mlcast model on its run's test split, to a Zarr store"
+
+
 def _parse_slice(text: str) -> slice:
     try:
         start, stop = text.split(":")
@@ -134,31 +167,16 @@ def _parse_slice(text: str) -> slice:
         ) from exc
 
 
-def add_run_mlcast_arguments(parser: argparse.ArgumentParser) -> None:
-    """
-    Add the arguments of ``mlcast.verify run-mlcast`` to `parser`.
-
-    Imports nothing beyond the standard library, so building the CLI stays cheap.
-    Only the checkpoint is needed to define the verification: the source data,
-    variable, input/forecast steps and the cases (the unique init times of the
-    crops mlcast samples for the test split, forecast over the full domain) come
-    from the run's ``config.yaml``.
-
-    Parameters
-    ----------
-    parser : argparse.ArgumentParser
-        Parser (sub-command) to add the arguments to.
-    """
+def _add_run_arguments(parser: argparse.ArgumentParser, action: str) -> None:
+    """Arguments defining the run, the model and the cases (shared by both commands)."""
     g = parser.add_argument_group("model")
     g.add_argument(
-        "--checkpoint", required=True, help="Lightning checkpoint (.ckpt) of the mlcast run"
+        "--config",
+        required=True,
+        help="the run's Fiddle config.yaml (mlcast writes it to <run>/config.yaml)",
     )
     g.add_argument(
-        "--config-yaml",
-        help=(
-            "the run's Fiddle config.yaml "
-            "(default: config.yaml next to the checkpoint or one level up)"
-        ),
+        "--checkpoint", required=True, help="Lightning checkpoint (.ckpt) of the mlcast run"
     )
     g.add_argument("--ensemble-size", type=int, default=20, help="number of members (default: 20)")
     g.add_argument(
@@ -172,7 +190,7 @@ def add_run_mlcast_arguments(parser: argparse.ArgumentParser) -> None:
         "--split",
         choices=("test", "val"),
         default="test",
-        help="split of the run config to verify on (default: test)",
+        help=f"split of the run config to {action} (default: test)",
     )
     g.add_argument(
         "--data-root",
@@ -201,6 +219,33 @@ def add_run_mlcast_arguments(parser: argparse.ArgumentParser) -> None:
     g.add_argument("--batch-size", type=int, default=1)
     g.add_argument("--num-workers", type=int, default=0)
 
+
+def build_verify_trained_model_parser(
+    prog: str | None = "mlcast verify-trained-model", *, add_help: bool = True
+) -> argparse.ArgumentParser:
+    """
+    Argument parser of the ``verify-trained-model`` command.
+
+    Imports nothing beyond the standard library. The source data, variable,
+    input/forecast steps and the cases (the unique init times of the crops mlcast
+    samples for the test split, forecast over the full domain) come from the run's
+    ``config.yaml``, which must be given with ``--config``.
+
+    Parameters
+    ----------
+    prog : str, optional
+        Program name shown in the usage.
+    add_help : bool
+        Add ``-h/--help`` (False to use the parser as a parent of another parser).
+
+    Returns
+    -------
+    argparse.ArgumentParser
+    """
+    parser = argparse.ArgumentParser(
+        prog=prog, description=VERIFY_HELP[0].upper() + VERIFY_HELP[1:] + ".", add_help=add_help
+    )
+    _add_run_arguments(parser, "verify on")
     g = parser.add_argument_group("output")
     g.add_argument(
         "--forecast-source", help="name of the forecast source (default: the run directory name)"
@@ -221,3 +266,107 @@ def add_run_mlcast_arguments(parser: argparse.ArgumentParser) -> None:
     g.add_argument("--truth", help="description of the truth (default: from the source attrs)")
     g.add_argument("--license", default="CC-BY-4.0")
     g.add_argument("--dataset-version", default="0.1.0")
+    return parser
+
+
+def build_forecast_trained_model_parser(
+    prog: str | None = "mlcast forecast-trained-model", *, add_help: bool = True
+) -> argparse.ArgumentParser:
+    """
+    Argument parser of the ``forecast-trained-model`` command.
+
+    Imports nothing beyond the standard library; the cases are defined as for
+    :func:`build_verify_trained_model_parser`.
+
+    Parameters
+    ----------
+    prog : str, optional
+        Program name shown in the usage.
+    add_help : bool
+        Add ``-h/--help`` (False to use the parser as a parent of another parser).
+
+    Returns
+    -------
+    argparse.ArgumentParser
+    """
+    parser = argparse.ArgumentParser(
+        prog=prog,
+        description=FORECAST_HELP[0].upper()
+        + FORECAST_HELP[1:]
+        + ". The store is written batch by batch (appending along init_time) and can "
+        "be scored with `mlcast.verify score`.",
+        add_help=add_help,
+    )
+    _add_run_arguments(parser, "forecast")
+    g = parser.add_argument_group("output")
+    g.add_argument(
+        "--forecast-source", help="name of the forecast source (default: the run directory name)"
+    )
+    g.add_argument(
+        "--out", required=True, help="output Zarr store of the forecasts (replaced if it exists)"
+    )
+    g.add_argument("--no-progress", action="store_true")
+    return parser
+
+
+def _core():
+    try:
+        from . import _mlcast_core
+    except ImportError as exc:
+        raise SystemExit(
+            "this command needs the `mlcast` extra "
+            "(pip install 'mlcast-verification-tools[mlcast]'); "
+            f"import failed with: {exc}"
+        ) from exc
+    return _mlcast_core
+
+
+def run_verify_trained_model(args: argparse.Namespace) -> int:
+    """Run ``verify-trained-model`` with parsed arguments (imports torch/mlcast)."""
+    return _core().verify_trained_model_from_args(args)
+
+
+def run_forecast_trained_model(args: argparse.Namespace) -> int:
+    """Run ``forecast-trained-model`` with parsed arguments (imports torch/mlcast)."""
+    return _core().forecast_trained_model_from_args(args)
+
+
+def verify_trained_model_main(argv: list[str] | None = None) -> int:
+    """Score a trained mlcast model on its run's test split, without storing forecasts.
+
+    Entry point of ``mlcast verify-trained-model`` (``mlcast.commands`` entry point).
+    Needs ``--config`` (the run's ``config.yaml``), ``--checkpoint`` and ``--out``.
+
+    Parameters
+    ----------
+    argv : list of str, optional
+        Arguments without the command name; default ``sys.argv[1:]``.
+
+    Returns
+    -------
+    int
+        Exit code.
+    """
+    args = build_verify_trained_model_parser().parse_args(argv)
+    return run_verify_trained_model(args)
+
+
+def forecast_trained_model_main(argv: list[str] | None = None) -> int:
+    """Forecast with a trained mlcast model on its run's test split, to a Zarr store.
+
+    Entry point of ``mlcast forecast-trained-model`` (``mlcast.commands`` entry
+    point). Needs ``--config`` (the run's ``config.yaml``), ``--checkpoint`` and
+    ``--out``; score the store with ``mlcast.verify score``.
+
+    Parameters
+    ----------
+    argv : list of str, optional
+        Arguments without the command name; default ``sys.argv[1:]``.
+
+    Returns
+    -------
+    int
+        Exit code.
+    """
+    args = build_forecast_trained_model_parser().parse_args(argv)
+    return run_forecast_trained_model(args)

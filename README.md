@@ -77,36 +77,74 @@ version comes from the git tag.
 
 ## Usage
 
-Score forecasts stored on disk (`(init_time, lead_time, member, y, x)` in mm/h, radar as
-`(time, y, x)`):
+Verification has three steps: **forecasts** (`ds_forecasts`) and **truth** (`ds_truth`)
+go into **`compute_scores`**, which gives the per-case scores. A trained mlcast model is
+described by its **training config** (the `config.yaml` mlcast writes next to
+`checkpoints/`) and a **checkpoint**. The config defines the network, the source data,
+the variable, the input/forecast steps and the test split.
 
 ```python
+from mlcast_verification_tools.integrations.mlcast import (
+    forecast_mlcast, load_run_config, open_truth, verify_mlcast_run,
+)
 from mlcast_verification_tools.offline import compute_scores
 from mlcast_verification_tools.io import write_scores, validate_scores
 from mlcast_verification_tools.plots import plot_all
 
-scores = compute_scores({"irene": fc_irene, "steps": fc_steps}, radar)  # GPU if available
-path = write_scores(
-    scores, "scores.zarr",
-    title="...", forecasts="...", truth="...",
-)
+config = load_run_config("logs/mlcast/version_3/config.yaml")  # the run's training config
+checkpoint = "logs/mlcast/version_3/checkpoints/best.ckpt"
+
+# a) forecast first (written to Zarr batch by batch), then score
+ds_forecasts = forecast_mlcast(config, checkpoint, ensemble_size=20, out="forecasts.zarr")
+ds_truth = open_truth(config)                     # the run's radar data, in mm/h
+scores = compute_scores(ds_forecasts, ds_truth)  # on the GPU if available
+
+# b) or forecast and score on the fly on the GPU, never storing the forecasts
+scores = verify_mlcast_run(config, checkpoint, ensemble_size=20)
+
+path = write_scores(scores, "scores.zarr", title="...", forecasts="...", truth="...")
 validate_scores(path).console_print()
 plot_all(scores, "figures/")
 ```
 
-Score a trained mlcast run on the GPU without writing forecasts to disk. Only the
-checkpoint is needed. Everything else comes from the run's `config.yaml`, which mlcast
-writes next to `checkpoints/`: the network, the source Zarr, the variable, the
-input/forecast steps and the test split. Run it from the directory training was started
-from, because the config's data paths (e.g. `./data/radar.zarr`) are relative; otherwise
-pass `--data-root`, or `--zarr-path`/`--index-path`:
+Both paths give the same scores for the same arguments and seed. Forecasts of other
+models can be scored in the same way, by building `ds_forecasts` yourself:
+
+- `ds_forecasts`: data variable `tp` with dims
+  `(forecast_source, init_time, lead_time, member, y, x)` and a `units` attribute
+  (mm/h, kg m-2 h-1 or kg m-2 s-1). Sources with fewer members are NaN-padded along
+  `member`; the `forecast_source` dim may instead be a scalar coordinate.
+- `ds_truth`: data variable `tp` with dims `(time, y, x)` on the same grid and a `units`
+  attribute; NaN marks invalid pixels.
+
+Scores of different sources are combined with
+`mlcast_verification_tools.accumulator.merge_sources`.
+
+The same steps on the command line. `--config` is always required. Run from the
+directory training was started from, because the config's data paths (e.g.
+`./data/radar.zarr`) are relative; otherwise pass `--data-root`, or
+`--zarr-path`/`--index-path`:
 
 ```bash
-mlcast.verify run-mlcast \
-    --checkpoint logs/mlcast/version_3/checkpoints/best.ckpt \
+RUN=logs/mlcast/version_3
+
+# a) forecast, then score
+mlcast forecast-trained-model --config $RUN/config.yaml --checkpoint $RUN/checkpoints/best.ckpt \
+    --out forecasts.zarr
+mlcast.verify score forecasts.zarr --truth-from-config $RUN/config.yaml --out scores.zarr
+
+# b) or on the fly
+mlcast verify-trained-model --config $RUN/config.yaml --checkpoint $RUN/checkpoints/best.ckpt \
     --out scores.zarr
+
 mlcast.verify plot scores.zarr --out figures/
 ```
+
+`mlcast forecast-trained-model` and `mlcast verify-trained-model` are registered as
+`mlcast` subcommands through mlcast's CLI plugin hook (entry-point group
+`mlcast.commands`). With an mlcast version that doesn't have the hook yet, use
+`mlcast.verify forecast-trained-model` / `mlcast.verify verify-trained-model`, which
+take the same arguments.
 
 The **cases are the unique init times of the crops mlcast's sampler selects for the test
 split** (`--split val` for the validation split). mlcast samples crops (256×256 pixels by default) from
@@ -118,9 +156,8 @@ the **full radar domain** (or a fixed `--region-y/--region-x`), because a score 
 holds one value per source, init time and lead time.
 
 `--max-cases N` evenly subsamples the init times for a quick run. `--forecast-steps`
-unrolls the model beyond its training horizon. From Python, use
-`verify_mlcast_run(checkpoint, ensemble_size=20)` (see `examples/mlcast_gpu.py`). To
-score arbitrary init times instead of the test split, build
+unrolls the model beyond its training horizon. `examples/mlcast_gpu.py` shows both
+paths end to end. To score arbitrary init times instead of the test split, build
 `VerificationDataset(source, init_times, input_steps, forecast_steps)` and pass it to
 `verify_mlcast_model`.
 

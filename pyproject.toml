@@ -61,6 +61,9 @@ urls.Homepage = "https://github.com/leifdenby/mlcast-verification-tools"
 urls.Issues = "https://github.com/leifdenby/mlcast-verification-tools/issues"
 urls.Repository = "https://github.com/leifdenby/mlcast-verification-tools"
 scripts."mlcast.verify" = "mlcast_verification_tools.cli:main"
+# `mlcast <command>` subcommands, picked up by mlcast's CLI plugin hook
+entry-points."mlcast.commands".forecast-trained-model = "mlcast_verification_tools.integrations.mlcast:forecast_trained_model_main"
+entry-points."mlcast.commands".verify-trained-model = "mlcast_verification_tools.integrations.mlcast:verify_trained_model_main"
 
 [dependency-groups]
 dev = [

@@ -7,11 +7,12 @@ sub-command) does not import torch or mlcast. Import from the public module.
 from __future__ import annotations
 
 import argparse
+import copy
 import math
 import os
 import pathlib
 import warnings
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
@@ -21,32 +22,14 @@ import xarray as xr
 from mlcast.data.normalization import DEFAULT_SCALING, ReflectivityScaling
 from torch.utils.data import DataLoader, Dataset
 
+from .. import conventions as cv
 from ..accumulator import ScoreAccumulator
+from ..units import mm_per_hour_factor
 from .mlcast import SUPPORTED_STANDARD_NAMES
 
 if TYPE_CHECKING:  # pragma: no cover
     import fiddle as fdl
     from mlcast.nowcasting_module import NowcastLightningModule
-
-_UNITS_FACTORS = {
-    # rates per hour: already mm/h (1 kg m-2 of water = 1 mm)
-    **dict.fromkeys(
-        (
-            "mm/h",
-            "mmh-1",
-            "mmh^-1",
-            "mm/hr",
-            "mmhr-1",
-            "kgm-2h-1",
-            "kgm^-2h^-1",
-            "kg/m2/h",
-            "kgm-2hr-1",
-        ),
-        1.0,
-    ),
-    # rates per second
-    **dict.fromkeys(("kgm-2s-1", "kgm^-2s^-1", "kg/m2/s", "mm/s", "mms-1", "mms^-1"), 3600.0),
-}
 
 # training-time path of a TensorBoard run is <log_dir>/checkpoints/<name>.ckpt with the
 # Fiddle config written to <log_dir>/config.yaml (mlcast.config.orchestrator)
@@ -64,35 +47,6 @@ def _check_standard_name(standard_name: str) -> None:
             f"standard_name {standard_name!r} is not supported, expected one of "
             f"{SUPPORTED_STANDARD_NAMES}"
         )
-
-
-def mm_per_hour_factor(units: str | None) -> float:
-    """
-    Factor converting values in `units` to mm/h.
-
-    Parameters
-    ----------
-    units : str or None
-        CF ``units`` attribute of a rain-rate variable, e.g. ``"mm/h"``,
-        ``"kg m-2 h-1"`` or ``"kg m-2 s-1"``. Case and whitespace are ignored.
-
-    Returns
-    -------
-    float
-        Multiply values by this factor to get mm/h.
-
-    Raises
-    ------
-    ValueError
-        If the units are missing or not recognised.
-    """
-    key = (units or "").strip().lower().replace(" ", "").replace("**", "^")
-    if key not in _UNITS_FACTORS:
-        raise ValueError(
-            f"cannot convert units {units!r} to mm/h; pass the conversion factor explicitly "
-            "(`to_mm_per_hour=` / `--to-mm-per-hour`)"
-        )
-    return _UNITS_FACTORS[key]
 
 
 def denormalize_torch(
@@ -259,6 +213,25 @@ def load_run_config(
             f"{config_yaml} is not an mlcast experiment config (no data.dataset_factory)"
         ) from exc
     data.splits = _tuplify_splits(data.splits)
+    _apply_data_overrides(
+        factory,
+        data_root=data_root,
+        zarr_path=zarr_path,
+        index_path=index_path,
+        storage_options=storage_options,
+    )
+    return cfg
+
+
+def _apply_data_overrides(
+    factory: Any,
+    *,
+    data_root: str | os.PathLike | None = None,
+    zarr_path: str | os.PathLike | None = None,
+    index_path: str | os.PathLike | None = None,
+    storage_options: dict[str, Any] | None = None,
+) -> None:
+    """Override and resolve the data paths of a dataset factory config (in place)."""
     if zarr_path is not None:
         factory.zarr_path = os.fspath(zarr_path)
     if index_path is not None:
@@ -270,13 +243,58 @@ def load_run_config(
         value = getattr(factory, name, None)
         if value is not None:
             setattr(factory, name, _resolve_path(value, root))
-    return cfg
 
 
 def _as_run_config(config: fdl.Config | str | os.PathLike) -> fdl.Config:
     if isinstance(config, str | os.PathLike):
         return load_run_config(config)
     return config
+
+
+def _resolve_config(
+    config: fdl.Config | str | os.PathLike,
+    *,
+    data_root: str | os.PathLike | None = None,
+    zarr_path: str | os.PathLike | None = None,
+    index_path: str | os.PathLike | None = None,
+    storage_options: dict[str, Any] | None = None,
+) -> tuple[fdl.Config, str]:
+    """
+    The run config (loaded if a path) with the data overrides applied, and a label.
+
+    A loaded config is copied before the overrides are applied, so the caller's
+    config is never modified. The label is the path of the ``config.yaml``, or
+    ``"the given run config"`` for a loaded config.
+    """
+    overrides = {
+        "data_root": data_root,
+        "zarr_path": zarr_path,
+        "index_path": index_path,
+        "storage_options": storage_options,
+    }
+    if config is None:
+        raise ValueError(
+            "the run's config (an fdl.Config or the path of its config.yaml) is needed"
+        )
+    if isinstance(config, str | os.PathLike):
+        return load_run_config(config, **overrides), os.fspath(config)
+    try:
+        config.data.dataset_factory  # noqa: B018 - checks the structure
+    except AttributeError as exc:
+        raise ValueError("not an mlcast experiment config (no data.dataset_factory)") from exc
+    if any(value is not None for value in overrides.values()):
+        config = copy.deepcopy(config)
+        _apply_data_overrides(config.data.dataset_factory, **overrides)
+    return config, "the given run config"
+
+
+def _single_standard_name(config: fdl.Config) -> str:
+    standard_names = list(config.data.dataset_factory.standard_names)
+    if len(standard_names) != 1:
+        raise ValueError(
+            f"only single-variable runs are supported, the config has {standard_names}"
+        )
+    return standard_names[0]
 
 
 def split_init_times(
@@ -339,26 +357,28 @@ def split_init_times(
 def load_mlcast_model(
     checkpoint_path: str | os.PathLike,
     *,
+    config: fdl.Config | str | os.PathLike | None,
     network: torch.nn.Module | None = None,
-    config: fdl.Config | str | os.PathLike | None = None,
     device: str | torch.device = "cpu",
 ) -> NowcastLightningModule:
     """
     Load a trained ``NowcastLightningModule`` from a Lightning checkpoint.
 
-    The network architecture is not stored in the checkpoint, so it is taken from,
-    in order: `network`; ``pl_module.network`` of the run config `config`; a
-    ``config.yaml`` found by :func:`find_config_yaml`. If none is available,
-    loading fails with a ValueError.
+    The network architecture is not stored in mlcast checkpoints, so it is rebuilt
+    from ``pl_module.network`` of the run config `config`, unless `network` is given.
+    The config is never looked up implicitly; :func:`find_config_yaml` locates the
+    ``config.yaml`` of a run if needed.
 
     Parameters
     ----------
     checkpoint_path : str or os.PathLike
         Lightning ``.ckpt`` file.
-    network : torch.nn.Module, optional
-        Network with the architecture used in training (weights are overwritten).
-    config : fdl.Config or str or os.PathLike, optional
+    config : fdl.Config or str or os.PathLike or None
         The run config (:func:`load_run_config`) or the path of its ``config.yaml``.
+        May only be None if `network` is given.
+    network : torch.nn.Module, optional
+        Network with the architecture used in training (weights are overwritten);
+        takes precedence over `config`.
     device : str or torch.device
         Device to load the weights to.
 
@@ -374,33 +394,25 @@ def load_mlcast_model(
     checkpoint_path = pathlib.Path(checkpoint_path)
     if network is None:
         if config is None:
-            config = find_config_yaml(checkpoint_path)
-        if isinstance(config, str | os.PathLike):
-            config = load_yaml_config(config)
-        if config is not None:
-            try:
-                network_cfg = config.pl_module.network
-            except AttributeError as exc:
-                raise ValueError("no pl_module.network in the run config") from exc
-            network = fdl.build(network_cfg)
-
-    kwargs: dict[str, Any] = {
-        "map_location": torch.device(device),
-        "strict": True,
-        "weights_only": False,
-    }
-    if network is None:
-        try:
-            model = NowcastLightningModule.load_from_checkpoint(checkpoint_path, **kwargs)
-        except TypeError as exc:
             raise ValueError(
                 f"cannot restore {checkpoint_path}: the network is not stored in mlcast "
-                "checkpoints. Pass `network=` or `config=` (the run's Fiddle config.yaml)."
-            ) from exc
-    else:
-        model = NowcastLightningModule.load_from_checkpoint(
-            checkpoint_path, network=network, **kwargs
-        )
+                "checkpoints. Pass `config=` (the run's config) or `network=`."
+            )
+        if isinstance(config, str | os.PathLike):
+            config = load_yaml_config(config)
+        try:
+            network_cfg = config.pl_module.network
+        except AttributeError as exc:
+            raise ValueError("no pl_module.network in the run config") from exc
+        network = fdl.build(network_cfg)
+
+    model = NowcastLightningModule.load_from_checkpoint(
+        checkpoint_path,
+        network=network,
+        map_location=torch.device(device),
+        strict=True,
+        weights_only=False,
+    )
     return model.to(device).eval()
 
 
@@ -640,11 +652,7 @@ class VerificationDataset(Dataset):
         """
         config = _as_run_config(config)
         factory = config.data.dataset_factory
-        standard_names = list(factory.standard_names)
-        if len(standard_names) != 1:
-            raise ValueError(
-                f"only single-variable runs are supported, the config has {standard_names}"
-            )
+        standard_name = _single_standard_name(config)
         init_times = split_init_times(config, split)
         if max_cases is not None:
             if max_cases < 1:
@@ -657,7 +665,7 @@ class VerificationDataset(Dataset):
             init_times,
             int(factory.input_steps),
             int(forecast_steps if forecast_steps is not None else factory.forecast_steps),
-            standard_name=standard_names[0],
+            standard_name=standard_name,
             region=region,
             storage_options=getattr(factory, "storage_options", None),
             **kwargs,
@@ -746,6 +754,25 @@ class VerificationDataset(Dataset):
         return (np.arange(1, self.forecast_steps + 1) * self.time_step.to_timedelta64()).astype(
             "timedelta64[ns]"
         )
+
+    def grid_coords(self) -> dict[str, xr.Variable]:
+        """
+        The ``y``/``x`` coordinates of the verification domain (region applied).
+
+        Returns
+        -------
+        dict
+            ``{"y": Variable, "x": Variable}`` with the source's coordinate values and
+            attributes, renamed to ``y``/``x``; a dim without a coordinate is left out.
+        """
+        coords = {}
+        for name, dim in (("y", self.y_dim), ("x", self.x_dim)):
+            if dim in self.ds.coords:
+                coord = self.ds[dim]
+                if name in self.region:
+                    coord = coord.isel({dim: self.region[name]})
+                coords[name] = xr.Variable(name, coord.values, dict(coord.attrs))
+        return coords
 
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
@@ -893,13 +920,64 @@ def verify_mlcast_model(
     xr.Dataset
         Score dataset in the spec layout, without global attributes.
     """
+    acc = ScoreAccumulator(
+        forecast_source, dataset.lead_times, dataset.dx_km, seed=seed, compute_psd=compute_psd
+    )
+    batches = _iter_forecasts(
+        model,
+        dataset,
+        ensemble_size,
+        batch_size=batch_size,
+        device=device,
+        num_workers=num_workers,
+        seed=seed,
+        member_chunk=member_chunk,
+        progress=progress,
+        desc=f"verifying {forecast_source}",
+    )
+    with torch.inference_mode():
+        for preds, obs, mask, init_times in batches:
+            acc.update(preds, obs, mask, init_times)
+            del preds, obs, mask
+    return acc.to_dataset()
+
+
+def _iter_forecasts(
+    model,
+    dataset: VerificationDataset,
+    ensemble_size: int,
+    *,
+    batch_size: int = 1,
+    device: str | torch.device | None = None,
+    num_workers: int = 0,
+    seed: int = 0,
+    member_chunk: int | None = None,
+    progress: bool = True,
+    desc: str = "forecasting",
+) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor, np.ndarray]]:
+    """
+    Run the model over the cases of `dataset`, batch by batch.
+
+    Seeds torch's global RNG with `seed` before the first batch, so the same
+    arguments give the same ensemble. Each batch is computed in inference mode;
+    consumers that modify the tensors in place should also run in inference mode.
+
+    Yields
+    ------
+    fc : torch.Tensor
+        Forecast ``(B, T, M, H, W)`` in mm/h on the device.
+    obs : torch.Tensor
+        Observation ``(B, T, H, W)`` in mm/h on the device, NaN replaced by 0 (NaN
+        pixels are outside `mask`).
+    mask : torch.Tensor
+        Boolean ``(B, H, W)`` on the device: finite at all input and target steps.
+    init_times : np.ndarray
+        ``datetime64[ns]`` init times of the B cases.
+    """
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     model = model.to(device).eval()
     chunks = _member_chunks(ensemble_size, member_chunk)
     scaling = dataset.scaling
-    acc = ScoreAccumulator(
-        forecast_source, dataset.lead_times, dataset.dx_km, seed=seed, compute_psd=compute_psd
-    )
     worker_kwargs: dict[str, Any] = {}
     if num_workers > 0:
         # Forked workers can deadlock once the parent has started threads (zarr/xarray
@@ -918,13 +996,13 @@ def verify_mlcast_model(
         try:
             from tqdm.auto import tqdm
 
-            batches = tqdm(loader, desc=f"verifying {forecast_source}", unit="batch")
+            batches = tqdm(loader, desc=desc, unit="batch")
         except ImportError:  # pragma: no cover
             pass
 
     torch.manual_seed(seed)  # also seeds all CUDA devices
-    with torch.inference_mode():
-        for batch in batches:
+    for batch in batches:
+        with torch.inference_mode():
             x = batch["input"].to(device, non_blocking=True)
             mask = batch["mask"].to(device, non_blocking=True)
             obs = batch["target"].to(device, non_blocking=True)
@@ -936,100 +1014,32 @@ def verify_mlcast_model(
             preds = denormalize_torch(preds, dataset.standard_name, scaling)
             if dataset.to_mm_per_hour != 1.0:
                 preds.mul_(dataset.to_mm_per_hour)
-            acc.update(preds, obs, mask, init_times)
-            del preds, x, obs, mask
-    return acc.to_dataset()
+            del x
+        yield preds, obs, mask, init_times
+        del preds, obs, mask
 
 
 # ---------------------------------------------------------------------------
-# Command line
+# Runs of a training config: forecasts, truth and on-the-fly scores
 # ---------------------------------------------------------------------------
 
 
-def _describe_truth(dataset: VerificationDataset) -> str:
-    attrs = dataset.ds.attrs
+def _describe_source(
+    attrs: dict[str, Any], path: Any, variable: str, standard_name: str, units: Any
+) -> str:
     name = (
-        attrs.get("title")
-        or attrs.get("mlcast_dataset_identifier")
-        or str(dataset._path or "source data")
+        attrs.get("title") or attrs.get("mlcast_dataset_identifier") or str(path or "source data")
     )
     ident = attrs.get("mlcast_dataset_identifier")
     version = attrs.get("mlcast_dataset_version")
     tag = f" ({ident} v{version})" if ident and version else ""
-    return (
-        f"{name}{tag}, variable {dataset.variable!r} ({dataset.standard_name}, "
-        f"{dataset.units}) converted to mm/h"
-    )
+    return f"{name}{tag}, variable {variable!r} ({standard_name}, {units}) converted to mm/h"
 
 
-def run_mlcast_from_args(args: argparse.Namespace) -> int:
-    """
-    Run ``mlcast.verify run-mlcast``: load, verify and write the scores.
-
-    Parameters
-    ----------
-    args : argparse.Namespace
-        Parsed arguments of
-        :func:`mlcast_verification_tools.integrations.mlcast.add_run_mlcast_arguments`.
-
-    Returns
-    -------
-    int
-        Exit code (0).
-    """
-    from ..io import write_scores
-
-    region = {k: v for k, v in (("y", args.region_y), ("x", args.region_x)) if v is not None}
-    run = _prepare_run(
-        args.checkpoint,
-        config_yaml=args.config_yaml,
-        split=args.split,
-        forecast_source=args.forecast_source,
-        device=args.device,
-        max_cases=args.max_cases,
-        forecast_steps=args.forecast_steps,
-        data_root=args.data_root,
-        zarr_path=args.zarr_path,
-        index_path=args.index_path,
-        storage_options=args.storage_options,
-        region=region or None,
-        on_missing=args.on_missing,
-        to_mm_per_hour=args.to_mm_per_hour,
+def _describe_truth(dataset: VerificationDataset) -> str:
+    return _describe_source(
+        dataset.ds.attrs, dataset._path, dataset.variable, dataset.standard_name, dataset.units
     )
-    dataset = run.dataset
-    scores = verify_mlcast_model(
-        run.model,
-        dataset,
-        forecast_source=run.forecast_source,
-        ensemble_size=args.ensemble_size,
-        batch_size=args.batch_size,
-        device=run.device,
-        num_workers=args.num_workers,
-        seed=args.seed,
-        compute_psd=not args.no_psd,
-        member_chunk=args.member_chunk,
-        progress=not args.no_progress,
-    )
-    first, last = (pd.Timestamp(t) for t in dataset.init_times[[0, -1]])
-    forecasts = args.forecasts or (
-        f"{run.forecast_source}: mlcast model {pathlib.Path(args.checkpoint).name}, "
-        f"{args.ensemble_size}-member ensemble from {dataset.input_steps} input frames, "
-        f"full domain at the {len(dataset)} init times of the {args.split} split's sampled "
-        f"crops ({first:%Y-%m-%dT%H:%M} to {last:%Y-%m-%dT%H:%M}) of {run.config_yaml}"
-    )
-    path = write_scores(
-        scores,
-        args.out,
-        title=args.title or f"Verification scores of {run.forecast_source} ({args.split} split)",
-        forecasts=forecasts,
-        truth=args.truth or _describe_truth(dataset),
-        created_by=args.created_by,
-        created_with=args.created_with,
-        license=args.license,
-        dataset_version=args.dataset_version,
-    )
-    print(f"wrote scores of {len(dataset)} cases to {path}")
-    return 0
 
 
 class _Run(NamedTuple):
@@ -1037,7 +1047,9 @@ class _Run(NamedTuple):
     dataset: VerificationDataset
     forecast_source: str
     device: str
-    config_yaml: pathlib.Path
+    config_label: str
+    checkpoint: pathlib.Path
+    split: str
 
 
 def _default_forecast_source(checkpoint: pathlib.Path) -> str:
@@ -1048,9 +1060,9 @@ def _default_forecast_source(checkpoint: pathlib.Path) -> str:
 
 
 def _prepare_run(
+    config: fdl.Config | str | os.PathLike,
     checkpoint: str | os.PathLike,
     *,
-    config_yaml: str | os.PathLike | None = None,
     split: str = "test",
     forecast_source: str | None = None,
     device: str | torch.device | None = None,
@@ -1062,16 +1074,10 @@ def _prepare_run(
     storage_options: dict[str, Any] | None = None,
     **dataset_kwargs: Any,
 ) -> _Run:
+    """Config, model and cases shared by :func:`forecast_mlcast` and :func:`verify_mlcast_run`."""
     checkpoint = pathlib.Path(checkpoint)
-    if config_yaml is None:
-        config_yaml = find_config_yaml(checkpoint)
-        if config_yaml is None:
-            raise FileNotFoundError(
-                f"no {_CONFIG_YAML_NAME} next to {checkpoint} or one directory up; "
-                "pass the run's config.yaml explicitly"
-            )
-    config = load_run_config(
-        config_yaml,
+    config, label = _resolve_config(
+        config,
         data_root=data_root,
         zarr_path=zarr_path,
         index_path=index_path,
@@ -1087,15 +1093,287 @@ def _prepare_run(
         dataset,
         forecast_source or _default_forecast_source(checkpoint),
         device,
-        pathlib.Path(config_yaml),
+        label,
+        checkpoint,
+        split,
+    )
+
+
+def _describe_forecasts(run: _Run, ensemble_size: int) -> str:
+    dataset = run.dataset
+    first, last = (pd.Timestamp(t) for t in dataset.init_times[[0, -1]])
+    if dataset.region:
+        domain = "sub-domain " + ", ".join(
+            f"{k}={'' if s.start is None else s.start}:{'' if s.stop is None else s.stop}"
+            for k, s in dataset.region.items()
+        )
+    else:
+        domain = "full domain"
+    return (
+        f"{run.forecast_source}: mlcast model {run.checkpoint.name}, "
+        f"{ensemble_size}-member ensemble from {dataset.input_steps} input frames, "
+        f"{domain} at the {len(dataset)} init times of the {run.split} split's sampled "
+        f"crops ({first:%Y-%m-%dT%H:%M} to {last:%Y-%m-%dT%H:%M}) of {run.config_label}"
+    )
+
+
+def forecast_mlcast(
+    config: fdl.Config | str | os.PathLike,
+    checkpoint: str | os.PathLike,
+    *,
+    ensemble_size: int,
+    split: str = "test",
+    max_cases: int | None = None,
+    forecast_steps: int | None = None,
+    region: dict[str, slice] | None = None,
+    data_root: str | os.PathLike | None = None,
+    zarr_path: str | os.PathLike | None = None,
+    index_path: str | os.PathLike | None = None,
+    storage_options: dict[str, Any] | None = None,
+    forecast_source: str | None = None,
+    device: str | torch.device | None = None,
+    batch_size: int = 1,
+    num_workers: int = 0,
+    member_chunk: int | None = None,
+    seed: int = 0,
+    out: str | os.PathLike | None = None,
+    progress: bool = True,
+    **dataset_kwargs: Any,
+) -> xr.Dataset:
+    """
+    Forecasts of a trained mlcast run on the test split defined in its training config.
+
+    The cases are those of :func:`verify_mlcast_run` with the same arguments (same
+    config, checkpoint, split, ``max_cases``, ``region``, ...), and with the same
+    ``seed``, ``batch_size`` and ``member_chunk`` the ensemble is the same too, so
+    ``compute_scores(forecast_mlcast(config, ckpt, ...), open_truth(config))`` gives the
+    scores of ``verify_mlcast_run(config, ckpt, ...)``.
+
+    Pixels where an input or target frame of the case is invalid (NaN in the source
+    data, mlcast's validity mask) are NaN in the forecasts.
+
+    Parameters
+    ----------
+    config : fdl.Config or str or os.PathLike
+        The run's config (:func:`load_run_config`) or the path of its ``config.yaml``.
+    checkpoint : str or os.PathLike
+        Lightning ``.ckpt`` file of the run.
+    ensemble_size : int
+        Number of members.
+    split, max_cases, forecast_steps, region, data_root, zarr_path, index_path, \
+storage_options, forecast_source, device, batch_size, num_workers, member_chunk, seed, progress
+        See :func:`verify_mlcast_run`.
+    out : str or os.PathLike, optional
+        Zarr store to write the forecasts to, batch by batch (appending along
+        ``init_time``), so they never have to fit in memory; an existing store is
+        replaced. Default: keep the forecasts in memory.
+    **dataset_kwargs
+        Passed to :class:`VerificationDataset` (``on_missing``, ``to_mm_per_hour``, ...).
+
+    Returns
+    -------
+    xr.Dataset
+        Variable ``tp`` ``(forecast_source, init_time, lead_time, member, y, x)``
+        float32 in ``mm h-1``, with ``forecast_source`` of length 1 and the source's
+        ``x``/``y`` coordinates; global attributes describe the run. With `out`, the
+        store opened lazily with ``xr.open_zarr``.
+    """
+    run = _prepare_run(
+        config,
+        checkpoint,
+        split=split,
+        forecast_source=forecast_source,
+        device=device,
+        max_cases=max_cases,
+        forecast_steps=forecast_steps,
+        data_root=data_root,
+        zarr_path=zarr_path,
+        index_path=index_path,
+        storage_options=storage_options,
+        region=region,
+        **dataset_kwargs,
+    )
+    return _forecast_run(
+        run,
+        ensemble_size=ensemble_size,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        member_chunk=member_chunk,
+        seed=seed,
+        out=out,
+        progress=progress,
+    )
+
+
+def _forecast_run(
+    run: _Run,
+    *,
+    ensemble_size: int,
+    batch_size: int,
+    num_workers: int,
+    member_chunk: int | None,
+    seed: int,
+    out: str | os.PathLike | None,
+    progress: bool,
+) -> xr.Dataset:
+    dataset = run.dataset
+    static_coords: dict[str, Any] = {
+        cv.FORECAST_SOURCE: np.array([run.forecast_source], dtype=str),
+        cv.LEAD_TIME: dataset.lead_times,
+        cv.MEMBER: np.arange(ensemble_size),
+        **dataset.grid_coords(),
+    }
+    var_attrs = {
+        "units": "mm h-1",
+        "long_name": "precipitation rate",
+        "standard_name": "rainfall_rate",
+    }
+    attrs = {
+        "title": f"Forecasts of {run.forecast_source} ({run.split} split)",
+        "forecasts": _describe_forecasts(run, ensemble_size),
+        "truth": _describe_truth(dataset),
+        "checkpoint": str(run.checkpoint),
+        "config": run.config_label,
+        "split": run.split,
+        "ensemble_size": int(ensemble_size),
+        "seed": int(seed),
+    }
+
+    def to_dataset(values: np.ndarray, init_times: np.ndarray) -> xr.Dataset:
+        return xr.Dataset(
+            {cv.VARIABLE: (cv.FORECAST_DIMS, values[None], var_attrs)},
+            coords={**static_coords, cv.INIT_TIME: init_times},
+            attrs=attrs,
+        )
+
+    pieces: list[tuple[np.ndarray, np.ndarray]] = []
+    written = False
+    batches = _iter_forecasts(
+        run.model,
+        dataset,
+        ensemble_size,
+        batch_size=batch_size,
+        device=run.device,
+        num_workers=num_workers,
+        seed=seed,
+        member_chunk=member_chunk,
+        progress=progress,
+        desc=f"forecasting {run.forecast_source}",
+    )
+    with torch.inference_mode():
+        for preds, _obs, mask, init_times in batches:
+            # no forecast where mlcast's validity mask (inputs and targets) is False
+            preds.masked_fill_(~mask[:, None, None], float("nan"))
+            values = preds.to(torch.float32).cpu().numpy()
+            del preds, _obs, mask
+            if out is None:
+                pieces.append((values, init_times))
+                continue
+            ds = to_dataset(values, init_times)
+            with warnings.catch_warnings():
+                # zarr warns that consolidated metadata is not part of the v3 spec
+                warnings.filterwarnings("ignore", message=".*[Cc]onsolidated metadata.*")
+                if not written:
+                    _, t, m, h, w = values.shape
+                    encoding = {
+                        cv.VARIABLE: {"chunks": (1, 1, t, m, h, w)},
+                        cv.INIT_TIME: {"units": "seconds since 1970-01-01", "dtype": "int64"},
+                    }
+                    ds.to_zarr(out, mode="w", encoding=encoding)
+                    written = True
+                else:
+                    ds = ds.drop_vars([name for name in ds.coords if name != cv.INIT_TIME])
+                    ds.to_zarr(out, append_dim=cv.INIT_TIME)
+    if out is not None:
+        return xr.open_zarr(out)
+    return to_dataset(
+        np.concatenate([v for v, _ in pieces]), np.concatenate([t for _, t in pieces])
+    )
+
+
+def open_truth(
+    config: fdl.Config | str | os.PathLike,
+    *,
+    data_root: str | os.PathLike | None = None,
+    zarr_path: str | os.PathLike | None = None,
+    storage_options: dict[str, Any] | None = None,
+    region: dict[str, slice] | None = None,
+    to_mm_per_hour: float | None = None,
+) -> xr.Dataset:
+    """
+    The radar truth of a training run: its source variable as ``tp`` in mm/h, lazily.
+
+    The source Zarr and the variable are found as in :class:`VerificationDataset`
+    (the run's ``data.dataset_factory``: ``zarr_path``, ``storage_options`` and the
+    variable with the run's standard name), and the values are converted to mm/h with
+    the factor of its ``units`` (:func:`mm_per_hour_factor`). Times listed in a
+    ``missing_times`` coordinate are dropped.
+
+    Parameters
+    ----------
+    config : fdl.Config or str or os.PathLike
+        The run's config (:func:`load_run_config`) or the path of its ``config.yaml``.
+    data_root, zarr_path, storage_options
+        Where to find the data, see :func:`load_run_config`.
+    region : dict, optional
+        Integer index slices ``{"y": slice, "x": slice}``, the same sub-domain as given
+        to :func:`forecast_mlcast` so that the grids match. Default: full domain.
+    to_mm_per_hour : float, optional
+        Factor to mm/h; default from the variable's ``units``.
+
+    Returns
+    -------
+    xr.Dataset
+        Variable ``tp`` ``(time, y, x)`` in ``mm h-1`` (NaN = invalid) with the source's
+        ``x``/``y`` coordinates, dask-backed.
+    """
+    config, _ = _resolve_config(
+        config, data_root=data_root, zarr_path=zarr_path, storage_options=storage_options
+    )
+    factory = config.data.dataset_factory
+    path = factory.zarr_path
+    source = xr.open_zarr(path, storage_options=getattr(factory, "storage_options", None))
+    variable, standard_name = VerificationDataset._resolve_variable(
+        source, None, _single_standard_name(config)
+    )
+    da = source[variable]
+    t_dim = VerificationDataset._time_dim(da)
+    y_dim, x_dim = _spatial_dims(da, t_dim)
+    units = da.attrs.get("units")
+    factor = float(to_mm_per_hour) if to_mm_per_hour is not None else mm_per_hour_factor(units)
+
+    region = dict(region or {})
+    if set(region) - {"y", "x"}:
+        raise ValueError(f"region keys must be 'y' and/or 'x', got {sorted(region)}")
+    da = da.isel({{"y": y_dim, "x": x_dim}[k]: s for k, s in region.items()})
+    da = da.transpose(t_dim, y_dim, x_dim)
+    if "missing_times" in source.variables:
+        missing = source["missing_times"].values.astype("datetime64[ns]")
+        da = da.isel({t_dim: ~np.isin(da[t_dim].values.astype("datetime64[ns]"), missing)})
+    values = da.data if factor == 1.0 else da.data * np.float32(factor)
+
+    coords: dict[str, Any] = {cv.TIME: (cv.TIME, da[t_dim].values, dict(da[t_dim].attrs))}
+    for name, dim in ((cv.Y, y_dim), (cv.X, x_dim)):
+        if dim in da.coords:
+            coords[name] = (name, da[dim].values, dict(da[dim].attrs))
+    return xr.Dataset(
+        {
+            cv.VARIABLE: (
+                cv.TRUTH_DIMS,
+                values,
+                {"units": "mm h-1", "long_name": "precipitation rate", "source_variable": variable},
+            )
+        },
+        coords=coords,
+        attrs={"truth": _describe_source(source.attrs, path, variable, standard_name, units)},
     )
 
 
 def verify_mlcast_run(
+    config: fdl.Config | str | os.PathLike,
     checkpoint: str | os.PathLike,
     *,
     ensemble_size: int,
-    config_yaml: str | os.PathLike | None = None,
     split: str = "test",
     forecast_source: str | None = None,
     device: str | torch.device | None = None,
@@ -1117,20 +1395,24 @@ def verify_mlcast_run(
     """
     Score a trained mlcast run on the test split defined in its training config.
 
-    Finds and loads the run's ``config.yaml`` (:func:`load_run_config`), restores the
-    model from `checkpoint` (:func:`load_mlcast_model`), builds the cases
+    Uses the run's config (loaded with :func:`load_run_config` if a path), restores
+    the model from `checkpoint` (:func:`load_mlcast_model`), builds the cases
     (:meth:`VerificationDataset.from_mlcast_config`: the unique init times of the
     crops mlcast samples for the split, forecast over the full domain) and scores
-    them (:func:`verify_mlcast_model`).
+    them on the fly (:func:`verify_mlcast_model`); forecasts are never stored. The
+    same as ``compute_scores(forecast_mlcast(config, checkpoint, ...),
+    open_truth(config))`` with the same arguments.
 
     Parameters
     ----------
+    config : fdl.Config or str or os.PathLike
+        The run's config (:func:`load_run_config`) or the path of its ``config.yaml``
+        (:func:`find_config_yaml` locates it for a checkpoint). Relative data paths of
+        a ``config.yaml`` are resolved against `data_root`.
     checkpoint : str or os.PathLike
         Lightning ``.ckpt`` file of the run.
     ensemble_size : int
         Number of members.
-    config_yaml : str or os.PathLike, optional
-        The run's ``config.yaml``; default :func:`find_config_yaml`.
     split : {"test", "val"}
         Which split of the config to verify on.
     forecast_source : str, optional
@@ -1159,8 +1441,8 @@ def verify_mlcast_run(
         ``write_scores``).
     """
     run = _prepare_run(
+        config,
         checkpoint,
-        config_yaml=config_yaml,
         split=split,
         forecast_source=forecast_source,
         device=device,
@@ -1186,3 +1468,104 @@ def verify_mlcast_run(
         member_chunk=member_chunk,
         progress=progress,
     )
+
+
+# ---------------------------------------------------------------------------
+# Command line (argument parsers in .mlcast, which has no heavy imports)
+# ---------------------------------------------------------------------------
+
+
+def _prepare_run_from_args(args: argparse.Namespace) -> _Run:
+    region = {k: v for k, v in (("y", args.region_y), ("x", args.region_x)) if v is not None}
+    return _prepare_run(
+        args.config,
+        args.checkpoint,
+        split=args.split,
+        forecast_source=args.forecast_source,
+        device=args.device,
+        max_cases=args.max_cases,
+        forecast_steps=args.forecast_steps,
+        data_root=args.data_root,
+        zarr_path=args.zarr_path,
+        index_path=args.index_path,
+        storage_options=args.storage_options,
+        region=region or None,
+        on_missing=args.on_missing,
+        to_mm_per_hour=args.to_mm_per_hour,
+    )
+
+
+def verify_trained_model_from_args(args: argparse.Namespace) -> int:
+    """
+    Run ``verify-trained-model``: load the run, score it on the fly, write the scores.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Parsed arguments of
+        :func:`mlcast_verification_tools.integrations.mlcast.build_verify_trained_model_parser`.
+
+    Returns
+    -------
+    int
+        Exit code (0).
+    """
+    from ..io import write_scores
+
+    run = _prepare_run_from_args(args)
+    scores = verify_mlcast_model(
+        run.model,
+        run.dataset,
+        forecast_source=run.forecast_source,
+        ensemble_size=args.ensemble_size,
+        batch_size=args.batch_size,
+        device=run.device,
+        num_workers=args.num_workers,
+        seed=args.seed,
+        compute_psd=not args.no_psd,
+        member_chunk=args.member_chunk,
+        progress=not args.no_progress,
+    )
+    path = write_scores(
+        scores,
+        args.out,
+        title=args.title or f"Verification scores of {run.forecast_source} ({args.split} split)",
+        forecasts=args.forecasts or _describe_forecasts(run, args.ensemble_size),
+        truth=args.truth or _describe_truth(run.dataset),
+        created_by=args.created_by,
+        created_with=args.created_with,
+        license=args.license,
+        dataset_version=args.dataset_version,
+    )
+    print(f"wrote scores of {len(run.dataset)} cases to {path}")
+    return 0
+
+
+def forecast_trained_model_from_args(args: argparse.Namespace) -> int:
+    """
+    Run ``forecast-trained-model``: load the run and write its forecasts to a Zarr store.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Parsed arguments of
+        :func:`mlcast_verification_tools.integrations.mlcast.build_forecast_trained_model_parser`.
+
+    Returns
+    -------
+    int
+        Exit code (0).
+    """
+    run = _prepare_run_from_args(args)
+    _forecast_run(
+        run,
+        ensemble_size=args.ensemble_size,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        member_chunk=args.member_chunk,
+        seed=args.seed,
+        out=args.out,
+        progress=not args.no_progress,
+    )
+    print(f"wrote forecasts of {len(run.dataset)} cases to {args.out}")
+    return 0

@@ -71,8 +71,24 @@ def _smooth(field: np.ndarray, length_px: float) -> np.ndarray:
     return np.fft.ifft2(np.fft.fft2(field) * gauss).real
 
 
-def make_synthetic_data(seed: int = 0) -> tuple[xr.DataArray, dict[str, xr.DataArray]]:
-    """Make observations (time, y, x) and two forecasts (init_time, lead_time, member, y, x)."""
+SOURCES = [  # name, members, stochastic noise scale, smoothing length per lead time (px)
+    ("calibrated", 8, 1.0, 0.0),
+    ("smoothed", 4, 0.3, 0.6),
+]
+
+
+def make_synthetic_data(seed: int = 0) -> tuple[xr.Dataset, xr.Dataset]:
+    """
+    Make the truth and two ensemble forecasts in the layouts of `offline.compute_scores`.
+
+    Returns
+    -------
+    ds_truth : xr.Dataset
+        `tp` with dims (time, y, x) in mm/h.
+    ds_forecasts : xr.Dataset
+        `tp` with dims (forecast_source, init_time, lead_time, member, y, x) in mm/h;
+        the source with fewer members is NaN-padded along `member`.
+    """
     rng = np.random.default_rng(seed)
     n_times = N_INIT_TIMES * INIT_SPACING_STEPS + N_LEAD_TIMES + 1
     times = pd.date_range("2025-06-01", periods=n_times, freq=TIME_STEP)
@@ -83,30 +99,45 @@ def make_synthetic_data(seed: int = 0) -> tuple[xr.DataArray, dict[str, xr.DataA
     latent[0] = _noise(rng, ())
     for t in range(1, n_times):
         latent[t] = _step(latent[t - 1], rng)
-    obs = xr.DataArray(
-        _to_rain(latent), dims=("time", "y", "x"), coords={"time": times, "y": y, "x": x}
+    truth = _to_rain(latent)
+    truth[:, :10, :20] = np.nan  # a corner outside radar coverage
+    ds_truth = xr.Dataset(
+        {"tp": (("time", "y", "x"), truth, {"units": "mm h-1"})},
+        coords={"time": times, "y": y, "x": x},
     )
-    obs[:, :10, :20] = np.nan  # a corner outside radar coverage
 
     init_idx = np.arange(N_INIT_TIMES) * INIT_SPACING_STEPS
     lead_times = pd.timedelta_range(TIME_STEP, periods=N_LEAD_TIMES, freq=TIME_STEP)
-    forecasts = {}
-    for name, n_members, noise_scale, smoothing_px in [
-        ("calibrated", 8, 1.0, 0.0),
-        ("smoothed", 4, 0.3, 0.6),
-    ]:
-        fc = np.empty((N_INIT_TIMES, N_LEAD_TIMES, n_members, GRID, GRID), dtype=np.float32)
+    max_members = max(n for _, n, _, _ in SOURCES)
+    fc = np.full(
+        (len(SOURCES), N_INIT_TIMES, N_LEAD_TIMES, max_members, GRID, GRID),
+        np.nan,
+        dtype=np.float32,
+    )
+    for s, (_, n_members, noise_scale, smoothing_px) in enumerate(SOURCES):
         for i, t0 in enumerate(init_idx):
             state = np.repeat(latent[t0][None], n_members, axis=0)
             for lt in range(N_LEAD_TIMES):
                 state = _step(state, rng, noise_scale)
-                fc[i, lt] = _to_rain(_smooth(state, smoothing_px * (lt + 1)))
-        forecasts[name] = xr.DataArray(
-            fc,
-            dims=("init_time", "lead_time", "member", "y", "x"),
-            coords={"init_time": times[init_idx], "lead_time": lead_times, "y": y, "x": x},
-        )
-    return obs, forecasts
+                fc[s, i, lt, :n_members] = _to_rain(_smooth(state, smoothing_px * (lt + 1)))
+    ds_forecasts = xr.Dataset(
+        {
+            "tp": (
+                ("forecast_source", "init_time", "lead_time", "member", "y", "x"),
+                fc,
+                {"units": "mm h-1"},
+            )
+        },
+        coords={
+            "forecast_source": [name for name, *_ in SOURCES],
+            "init_time": times[init_idx],
+            "lead_time": lead_times,
+            "member": np.arange(max_members),
+            "y": y,
+            "x": x,
+        },
+    )
+    return ds_truth, ds_forecasts
 
 
 def main() -> None:
@@ -117,10 +148,10 @@ def main() -> None:
     args.out.mkdir(parents=True, exist_ok=True)
 
     print("Making synthetic observations and forecasts ...")
-    obs, forecasts = make_synthetic_data(args.seed)
+    ds_truth, ds_forecasts = make_synthetic_data(args.seed)
 
     print("Computing per-case scores ...")
-    scores = compute_scores(forecasts, obs, batch_size=4, seed=args.seed)
+    scores = compute_scores(ds_forecasts, ds_truth, batch_size=4, seed=args.seed)
 
     path = write_scores(
         scores,

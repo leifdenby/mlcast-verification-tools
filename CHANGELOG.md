@@ -34,6 +34,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `mlcast.verify run-mlcast` no longer require `created_by`/`created_with`.
   `mlcast_created_with` defaults to this package's repository and revision, and
   `mlcast_created_by` is only written when given.
+- Three-step Python API with the training config as explicit input:
+  `forecast_mlcast(config, checkpoint, ...)` makes a forecast dataset (in memory or
+  written to Zarr batch by batch), `open_truth(config)` gives the run's radar truth in
+  mm/h, and `compute_scores(ds_forecasts, ds_truth)` scores them (it takes xr.Datasets
+  instead of a dict of DataArrays). `verify_mlcast_run(config, checkpoint, ...)` does the
+  same on the fly; the config is no longer discovered next to the checkpoint.
+- `mlcast forecast-trained-model` and `mlcast verify-trained-model` subcommands,
+  registered through mlcast's CLI plugin hook (entry-point group `mlcast.commands`), and
+  the same commands plus `score` under `mlcast.verify`. `--config` is required;
+  `mlcast.verify run-mlcast` is removed.
 - DataLoader workers of `verify_mlcast_model` are spawned instead of forked. Forked
   workers could deadlock.
 - Development setup: pre-commit hooks (ruff, pyproject-fmt), and CI workflows for

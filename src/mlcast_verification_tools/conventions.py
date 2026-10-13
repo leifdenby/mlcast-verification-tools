@@ -19,6 +19,16 @@ WAVELENGTH = "wavelength"
 
 CASE_DIMS = (FORECAST_SOURCE, INIT_TIME, LEAD_TIME)
 
+# Dims of the *input* datasets of `offline.compute_scores` (see the `offline` module):
+# forecasts `(forecast_source, init_time, lead_time, member, y, x)` and truth
+# `(time, y, x)`, with `x`/`y` projection coordinates on the same grid.
+MEMBER = "member"
+TIME = "time"
+X = "x"
+Y = "y"
+FORECAST_DIMS = (FORECAST_SOURCE, INIT_TIME, LEAD_TIME, MEMBER, Y, X)
+TRUTH_DIMS = (TIME, Y, X)
+
 # short name of the verified physical variable (precipitation rate)
 VARIABLE = "tp"
 

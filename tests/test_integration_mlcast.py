@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import argparse
 import importlib
 
 import numpy as np
@@ -603,19 +602,19 @@ def test_load_mlcast_model(tmp_path):
             torch.testing.assert_close(v, v2)
 
     # explicit network
-    assert_same_weights(mi.load_mlcast_model(ckpt, network=ConvGruModel(num_blocks=2)))
+    assert_same_weights(mi.load_mlcast_model(ckpt, config=None, network=ConvGruModel(num_blocks=2)))
 
-    # no network, no config: mlcast's own loading cannot restore the network
-    with pytest.raises(ValueError, match="network is not stored"):
+    # the config is a required argument, never looked up next to the checkpoint
+    with pytest.raises(TypeError):
         mi.load_mlcast_model(ckpt)
+    with pytest.raises(ValueError, match="network is not stored"):
+        mi.load_mlcast_model(ckpt, config=None)
 
-    # explicit config (path or loaded), and auto-discovered <run>/config.yaml
+    # explicit config (path or loaded)
     config = tmp_path / "elsewhere.yaml"
     _dump_config(_experiment_config(num_blocks=2), config)
     assert_same_weights(mi.load_mlcast_model(ckpt, config=config))
     assert_same_weights(mi.load_mlcast_model(ckpt, config=mi.load_run_config(config)))
-    (run_dir / "config.yaml").write_text(config.read_text())
-    assert_same_weights(mi.load_mlcast_model(ckpt))
 
 
 @pytest.fixture
@@ -633,6 +632,7 @@ def test_verify_mlcast_run(data_root, run_dir, tmp_path, offline_metadata):
 
     ckpt = run_dir / "checkpoints" / "epoch=0-step=1.ckpt"
     scores = mi.verify_mlcast_run(
+        run_dir / "config.yaml",
         ckpt,
         ensemble_size=3,
         data_root=data_root,
@@ -656,42 +656,230 @@ def test_verify_mlcast_run(data_root, run_dir, tmp_path, offline_metadata):
     report = validate_scores(path)
     assert not report.has_fails(), [r for r in report.results if r.status == "FAIL"]
 
-    with pytest.raises(FileNotFoundError, match="config.yaml"):
-        mi.verify_mlcast_run(tmp_path / "model.ckpt", ensemble_size=2)
+    # the config is required: there is no auto-discovery next to the checkpoint
+    with pytest.raises(TypeError):
+        mi.verify_mlcast_run(ckpt, ensemble_size=2)
+    with pytest.raises(ValueError, match="config"):
+        mi.verify_mlcast_run(None, ckpt, ensemble_size=2)
 
 
-def test_run_mlcast_cli(data_root, run_dir, monkeypatch):
+# --- forecasts and truth of a run, and their equivalence with the on-the-fly scores ---------
+
+REGION = {"y": slice(0, 16), "x": slice(4, None)}
+
+
+def _run_kwargs(data_root, **extra):
+    kwargs = {
+        "ensemble_size": 3,
+        "data_root": data_root,
+        "device": "cpu",
+        "max_cases": 3,
+        "batch_size": 2,
+        "seed": 7,
+        "progress": False,
+    }
+    return {**kwargs, **extra}
+
+
+def _check_forecasts(ds: xr.Dataset, n_cases: int, n_members: int, ny: int, nx: int) -> None:
+    assert list(ds.data_vars) == [cv.VARIABLE]
+    tp = ds[cv.VARIABLE]
+    assert tp.dims == cv.FORECAST_DIMS
+    assert tp.shape == (1, n_cases, FORECAST_STEPS, n_members, ny, nx)
+    assert tp.dtype == np.float32
+    assert tp.attrs["units"] == "mm h-1"
+    assert ds[cv.FORECAST_SOURCE].values.tolist() == ["version_0"]
+    assert np.issubdtype(ds[cv.INIT_TIME].dtype, np.datetime64)
+    assert np.issubdtype(ds[cv.LEAD_TIME].dtype, np.timedelta64)
+    assert ds[cv.LEAD_TIME].values[0] == np.timedelta64(5, "m")
+    np.testing.assert_array_equal(ds[cv.MEMBER].values, np.arange(n_members))
+    assert ds[cv.X].attrs["units"] == "m" and ds.sizes[cv.X] == nx
+    values = tp.values
+    assert (values[np.isfinite(values)] >= 0).all()
+    # pixel (0, 0) is NaN in every frame of the source: no forecast there
+    if ny == NY and nx == NX:
+        assert np.isnan(values[..., 0, 0]).all()
+    assert np.isfinite(values).mean() > 0.9
+
+
+def test_forecast_mlcast_in_memory_and_zarr(data_root, run_dir, tmp_path):
+    config = mi.load_run_config(run_dir / "config.yaml", data_root=data_root)
+    ckpt = run_dir / "checkpoints" / "epoch=0-step=1.ckpt"
+    kwargs = _run_kwargs(None)
+
+    in_memory = mi.forecast_mlcast(config, ckpt, **kwargs)
+    _check_forecasts(in_memory, 3, 3, NY, NX)
+    assert in_memory.attrs["split"] == "test" and in_memory.attrs["checkpoint"] == str(ckpt)
+    assert "init times of the test split" in in_memory.attrs["forecasts"]
+    # same cases as the on-the-fly verification
+    scores = mi.verify_mlcast_run(config, ckpt, **kwargs)
+    np.testing.assert_array_equal(in_memory[cv.INIT_TIME].values, scores[cv.INIT_TIME].values)
+
+    # written batch by batch (2 + 1 cases) to Zarr: the same forecasts
+    out = tmp_path / "forecasts.zarr"
+    on_disk = mi.forecast_mlcast(config, ckpt, out=out, **kwargs)
+    assert on_disk[cv.VARIABLE].chunks is not None  # lazily opened from the store
+    _check_forecasts(on_disk, 3, 3, NY, NX)
+    xr.testing.assert_identical(on_disk.load(), in_memory)
+
+
+def test_open_truth(data_root, run_dir):
+    truth = mi.open_truth(run_dir / "config.yaml", data_root=data_root)
+    tp = truth[cv.VARIABLE]
+    assert tp.dims == cv.TRUTH_DIMS and tp.attrs["units"] == "mm h-1"
+    assert tp.chunks is not None  # lazy
+    src = xr.open_zarr(data_root / "data" / "source.zarr")
+    np.testing.assert_array_equal(tp.values, src.RR.values)  # kg m-2 h-1 == mm/h
+    np.testing.assert_array_equal(truth[cv.TIME].values, src.time.values)
+    assert "XX-TEST v0.1.0" in truth.attrs["truth"]
+
+    cropped = mi.open_truth(run_dir / "config.yaml", data_root=data_root, region=REGION)
+    assert cropped.sizes == {cv.TIME: RUN_NT, cv.Y: 16, cv.X: NX - 4}
+    np.testing.assert_array_equal(cropped[cv.X].values, src.x.values[4:])
+
+
+def test_open_truth_units_and_missing_times(tmp_path, run_dir):
+    root = tmp_path / "si"
+    (root / "data").mkdir(parents=True)
+    src = _source_dataset(units="kg m-2 s-1", missing_time_index=None, nt=RUN_NT)
+    src = src.assign_coords(missing_times=("missing_times", src.time.values[[5]]))
+    src.to_zarr(root / "data" / "source.zarr", zarr_format=2)
+    truth = mi.open_truth(run_dir / "config.yaml", data_root=root)
+    assert truth.sizes[cv.TIME] == RUN_NT - 1
+    assert src.time.values[5] not in truth[cv.TIME].values
+    np.testing.assert_allclose(
+        truth[cv.VARIABLE].values[:5], src.RR.values[:5] * np.float32(3600), rtol=1e-6
+    )
+
+
+def _assert_scores_equal(got: xr.Dataset, expected: xr.Dataset) -> None:
+    assert set(got.data_vars) == set(expected.data_vars)
+    for coord in (cv.FORECAST_SOURCE, cv.INIT_TIME, cv.LEAD_TIME):
+        np.testing.assert_array_equal(got[coord].values, expected[coord].values)
+    for name in expected.data_vars:
+        np.testing.assert_allclose(
+            got[name].values, expected[name].values, rtol=1e-6, atol=1e-12, err_msg=name
+        )
+
+
+@pytest.mark.parametrize("region", [None, REGION], ids=["full", "region"])
+def test_forecast_then_score_equals_verify(data_root, run_dir, region):
+    """compute_scores(forecast_mlcast(...), open_truth(config)) == verify_mlcast_run(...)."""
+    from mlcast_verification_tools.offline import compute_scores
+
+    config = mi.load_run_config(run_dir / "config.yaml", data_root=data_root)
+    ckpt = run_dir / "checkpoints" / "epoch=0-step=1.ckpt"
+    kwargs = _run_kwargs(None, region=region, member_chunk=2)
+
+    expected = mi.verify_mlcast_run(config, ckpt, **kwargs)
+    ds_forecasts = mi.forecast_mlcast(config, ckpt, **kwargs)
+    ds_truth = mi.open_truth(config, region=region)
+    got = compute_scores(
+        ds_forecasts, ds_truth, device="cpu", batch_size=kwargs["batch_size"], seed=kwargs["seed"]
+    )
+    _check_scores(got, 3, 3)
+    _assert_scores_equal(got, expected)
+
+
+def test_config_object_not_modified(data_root, run_dir, tmp_path):
+    config = mi.load_run_config(run_dir / "config.yaml", data_root=data_root)
+    zarr_path = config.data.dataset_factory.zarr_path
+    with pytest.raises(Exception):  # noqa: B017 - the overridden store does not exist
+        mi.open_truth(config, zarr_path=tmp_path / "nowhere.zarr")
+    assert config.data.dataset_factory.zarr_path == zarr_path
+
+
+# --- command line -------------------------------------------------------------------------------
+
+
+def _cli_case_args(run_dir) -> list[str]:
+    return [
+        "--config", str(run_dir / "config.yaml"),
+        "--checkpoint", str(run_dir / "checkpoints" / "epoch=0-step=1.ckpt"),
+        "--ensemble-size", "3",
+        "--max-cases", "4",
+        "--device", "cpu",
+        "--batch-size", "2",
+        "--seed", "3",
+        "--region-y", "0:16",
+        "--region-x", "4:",
+        "--no-progress",
+    ]  # fmt: skip
+
+
+def test_verify_trained_model_cli(data_root, run_dir, monkeypatch):
     from mlcast_verification_tools.cli import main
     from mlcast_verification_tools.io import open_scores
 
     monkeypatch.chdir(data_root)  # the config's data paths are relative to it
     out = data_root / "scores.nc"
-    argv = [
-        "run-mlcast",
-        "--checkpoint", str(run_dir / "checkpoints" / "epoch=0-step=1.ckpt"),
-        "--out", str(out),
-        "--ensemble-size", "3",
-        "--max-cases", "4",
-        "--device", "cpu",
-        "--batch-size", "2",
-        "--region-y", "0:16",
-        "--region-x", "4:",
-        "--no-progress",
-    ]  # fmt: skip
+    argv = ["verify-trained-model", *_cli_case_args(run_dir), "--out", str(out)]
     assert main(argv) == 0
     scores = open_scores(out).load()
     _check_scores(scores, 4, 3)
     assert "version_0" in scores.attrs["title"] and "test split" in scores.attrs["title"]
     assert "XX-TEST v0.1.0" in scores.attrs["truth"]
     assert "init times of the test split" in scores.attrs["forecasts"]
+    assert "sub-domain y=0:16, x=4:" in scores.attrs["forecasts"]
     # provenance is optional: this tool's repository@revision, no creator contact
     assert scores.attrs["mlcast_created_with"].startswith(
         "https://github.com/leifdenby/mlcast-verification-tools@"
     )
     assert "mlcast_created_by" not in scores.attrs
 
-    # the arguments the config provides are gone
-    parser = argparse.ArgumentParser()
-    mi.add_run_mlcast_arguments(parser)
+    # the mlcast plugin entry point gives the same scores
+    out2 = data_root / "scores2.nc"
+    assert mi.verify_trained_model_main([*_cli_case_args(run_dir), "--out", str(out2)]) == 0
+    xr.testing.assert_identical(open_scores(out2).load(), scores)
+
+    # the arguments the config provides are gone, and the config is required
+    parser = mi.build_verify_trained_model_parser()
     with pytest.raises(SystemExit):
         parser.parse_args([*argv[1:], "--source", "x.zarr"])
+    without_config = [a for a in argv[1:] if a not in ("--config", str(run_dir / "config.yaml"))]
+    with pytest.raises(SystemExit) as exc:
+        parser.parse_args(without_config)
+    assert exc.value.code == 2
+
+
+def test_forecast_then_score_cli_equals_verify_cli(data_root, run_dir, monkeypatch):
+    """`forecast-trained-model` + `score` == `verify-trained-model`, also via `plot`."""
+    from mlcast_verification_tools.cli import main
+    from mlcast_verification_tools.io import open_scores
+
+    monkeypatch.chdir(data_root)
+    case_args = _cli_case_args(run_dir)
+    forecasts = data_root / "forecasts.zarr"
+    assert main(["forecast-trained-model", *case_args, "--out", str(forecasts)]) == 0
+    ds_forecasts = xr.open_zarr(forecasts)
+    _check_forecasts(ds_forecasts, 4, 3, 16, NX - 4)
+
+    via_score = data_root / "via_score.zarr"
+    argv = [
+        "score", str(forecasts),
+        "--truth-from-config", str(run_dir / "config.yaml"),
+        "--region-y", "0:16", "--region-x", "4:",
+        "--out", str(via_score),
+        "--device", "cpu", "--batch-size", "2", "--seed", "3",
+    ]  # fmt: skip
+    assert main(argv) == 0
+    direct = data_root / "direct.zarr"
+    assert main(["verify-trained-model", *case_args, "--out", str(direct)]) == 0
+
+    got, expected = open_scores(via_score).load(), open_scores(direct).load()
+    _assert_scores_equal(got, expected)
+    assert got.attrs["forecasts"] == expected.attrs["forecasts"]
+    assert got.attrs["truth"] == expected.attrs["truth"]
+
+    # a stored truth dataset works the same
+    truth_path = data_root / "truth.zarr"
+    mi.open_truth(run_dir / "config.yaml", region=REGION).to_zarr(truth_path)
+    via_truth = data_root / "via_truth.nc"
+    argv = ["score", str(forecasts), "--truth", str(truth_path), "--out", str(via_truth),
+            "--device", "cpu", "--batch-size", "2", "--seed", "3"]  # fmt: skip
+    assert main(argv) == 0
+    _assert_scores_equal(open_scores(via_truth).load(), expected)
+
+    figures = data_root / "figures"
+    assert main(["plot", str(via_score), "--out", str(figures)]) == 0
+    assert len(list(figures.iterdir())) == 4
