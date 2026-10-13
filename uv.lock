@@ -2858,6 +2858,7 @@ mlcast = [
     { name = "loguru" },
     { name = "mlcast" },
     { name = "pytorch-lightning" },
+    { name = "rich" },
 ]
 
 [package.dev-dependencies]
@@ -2879,6 +2880,7 @@ requires-dist = [
     { name = "numpy", specifier = ">=2" },
     { name = "pandas", specifier = ">=2" },
     { name = "pytorch-lightning", marker = "extra == 'mlcast'", specifier = ">=2" },
+    { name = "rich", marker = "extra == 'mlcast'", specifier = ">=13" },
     { name = "torch", marker = "extra == 'cpu'", specifier = ">=2.7.1", index = "https://download.pytorch.org/whl/cpu", conflict = { package = "mlcast-verification-tools", extra = "cpu" } },
     { name = "torch", marker = "extra == 'gpu-cu126'", specifier = ">=2.7.1", index = "https://download.pytorch.org/whl/cu126", conflict = { package = "mlcast-verification-tools", extra = "gpu-cu126" } },
     { name = "torch", marker = "extra == 'gpu-cu128'", specifier = ">=2.7.1", index = "https://download.pytorch.org/whl/cu128", conflict = { package = "mlcast-verification-tools", extra = "gpu-cu128" } },

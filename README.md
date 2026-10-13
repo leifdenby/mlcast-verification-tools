@@ -162,8 +162,8 @@ the window. Several crops at the same time give one case. Each case is then fore
 the **full radar domain** (or a fixed `--region-y/--region-x`), because a score file
 holds one value per source, init time and lead time.
 
-Before the first batch the cases are summarised in the log (source, domain, init times,
-steps, ensemble, batching), and the progress bar shows the mean time per batch spent
+Before the first batch a summary panel shows what is verified (source, domain, init
+times, steps, model, ensemble, workload, batching, device), and the progress bar shows the mean time per batch spent
 waiting for data, in the model and in the scores. The cost per case is dominated by the
 model: every case is a full-domain forecast for every member and lead time, so the run
 time scales with cases × members × lead times × grid size. To make it faster:

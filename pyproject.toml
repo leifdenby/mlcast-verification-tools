@@ -57,6 +57,7 @@ optional-dependencies.mlcast = [
   "loguru>=0.7",
   "mlcast",
   "pytorch-lightning>=2",
+  "rich>=13",
 ]
 urls.Homepage = "https://github.com/leifdenby/mlcast-verification-tools"
 urls.Issues = "https://github.com/leifdenby/mlcast-verification-tools/issues"

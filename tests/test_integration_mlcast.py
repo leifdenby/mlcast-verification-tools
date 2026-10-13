@@ -418,9 +418,10 @@ def test_verify_bf16_autocast(source_path):
         mi.verify_mlcast_model(AdapterModel(), ds, precision="fp16", **kwargs)
 
 
-def test_verify_logs_cases(source_path):
+def test_verify_prints_summary_and_logs_time(source_path, capsys, monkeypatch):
     from loguru import logger
 
+    monkeypatch.setenv("COLUMNS", "300")  # rich wraps at the terminal width otherwise
     ds = mi.VerificationDataset(
         source_path, _valid_init_times(3), INPUT_STEPS, FORECAST_STEPS,
         region={"y": slice(0, 8)},
@@ -430,17 +431,22 @@ def test_verify_logs_cases(source_path):
     try:
         mi.verify_mlcast_model(
             AdapterModel(), ds, forecast_source="convgru", ensemble_size=5, member_chunk=2,
-            batch_size=2, compute_psd=False, device="cpu", precision="bf16", progress=False,
+            batch_size=2, compute_psd=False, device="cpu", precision="bf16", progress=True,
         )  # fmt: skip
     finally:
         logger.remove(sink)
-    text = "".join(messages)
-    assert "Verifying convgru on 3 cases:" in text
-    assert f"8 x {ds.grid_shape[1]} pixels (sub-domain y=0:8)" in text
-    assert f"{INPUT_STEPS} input, {FORECAST_STEPS} forecast every 5 min" in text
-    assert "5 members, 2 model calls of 2/3 members per batch" in text
-    assert "2 of 2 cases, 0 workers, device cpu, bfloat16 autocast" in text
-    assert re.search(r"Verifying convgru done: 3 cases in 0:00:\d\d \(", text)
+    panel = capsys.readouterr().err
+    w = ds.grid_shape[1]
+    assert "🎯 Verifying convgru" in panel
+    assert f"8 × {w} px   dx 1 km   (sub-domain y=0:8)" in panel
+    assert "3 cases" in panel
+    assert f"{INPUT_STEPS} input + {FORECAST_STEPS} forecast × 5 min" in panel
+    assert "ConvGruModel" in panel
+    assert "5 members   2 model calls of 2/3 members per batch" in panel
+    assert f"3 cases × 5 members × {FORECAST_STEPS} steps = {3 * 5 * FORECAST_STEPS}" in panel
+    assert "2 × 2 cases   0 loader workers" in panel
+    assert "cpu   bfloat16 autocast" in panel
+    assert re.search(r"Verifying convgru done: 3 cases in 0:00:\d\d \(", "".join(messages))
 
 
 def test_verify_progress_shows_stage_times(source_path, monkeypatch):

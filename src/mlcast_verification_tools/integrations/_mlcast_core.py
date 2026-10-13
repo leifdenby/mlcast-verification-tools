@@ -1019,7 +1019,9 @@ def verify_mlcast_model(
         as fast on GPUs with bf16 tensor cores). The forecast is cast to float32 before
         it is de-normalised and scored either way.
     progress : bool
-        Show a tqdm progress bar, with the mean time per batch spent waiting for data,
+        Print a summary panel of the cases, model and batching to stderr (as mlcast's
+        sampler does) and show a tqdm progress bar, with the mean time per batch spent
+        waiting for data,
         in the model (including the transfer to the device and de-normalisation) and
         in the scores. The timing synchronises CUDA once per stage and batch.
 
@@ -1118,6 +1120,18 @@ def _iter_forecasts(
     batches = loader
     bar = None
     if progress:
+        _print_summary(
+            model,
+            dataset,
+            desc=desc,
+            ensemble_size=ensemble_size,
+            chunks=chunks,
+            batch_size=batch_size,
+            n_batches=len(loader),
+            num_workers=num_workers,
+            device=device,
+            precision=precision,
+        )
         try:
             from tqdm.auto import tqdm
 
@@ -1125,18 +1139,6 @@ def _iter_forecasts(
         except ImportError:  # pragma: no cover
             pass
     timer = _StageTimer(device, ("data", "model", consumer)) if bar is not None else None
-
-    _log_cases(
-        dataset,
-        desc=desc,
-        ensemble_size=ensemble_size,
-        chunks=chunks,
-        batch_size=batch_size,
-        n_batches=len(loader),
-        num_workers=num_workers,
-        device=device,
-        precision=precision,
-    )
     started = time.perf_counter()
     torch.manual_seed(seed)  # also seeds all CUDA devices
     if timer:
@@ -1177,7 +1179,17 @@ def _minutes(td: pd.Timedelta) -> str:
     return f"{td.total_seconds() / 60:g} min"
 
 
-def _log_cases(
+def _describe_model(model) -> str:
+    network = getattr(model, "network", model)
+    try:
+        n_params = sum(p.numel() for p in model.parameters())
+    except AttributeError:  # a plain callable
+        return type(network).__name__
+    return f"{type(network).__name__}, {n_params:,} parameters"
+
+
+def _print_summary(
+    model,
     dataset: VerificationDataset,
     *,
     desc: str,
@@ -1189,41 +1201,72 @@ def _log_cases(
     device: torch.device,
     precision: str,
 ) -> None:
-    """Log what is about to be forecast, in the style of mlcast's data module summary."""
+    """Print a panel of what is about to be forecast to stderr, as mlcast's sampler does."""
+    from rich.console import Console
+    from rich.markup import escape
+    from rich.panel import Panel
+    from rich.table import Table
+
     h, w = dataset.grid_shape
     first, last = (pd.Timestamp(t) for t in dataset.init_times[[0, -1]])
     skipped = len(dataset.skipped_init_times)
     lead_times = pd.to_timedelta(dataset.lead_times)
+    n_cases = len(dataset)
     calls = (
-        "one model call per batch"
+        "1 model call per batch"
         if len(chunks) == 1
         else f"{len(chunks)} model calls of {'/'.join(map(str, chunks))} members per batch"
     )
-    lines = [
-        ("source", f"{dataset._path or 'in-memory dataset'}"),
-        ("variable", f"{dataset.variable!r} ({dataset.standard_name}, {dataset.units})"),
-        ("domain", f"{h} x {w} pixels ({_describe_domain(dataset)}), dx {dataset.dx_km:g} km"),
-        (
-            "init times",
-            f"{len(dataset)} from {first:%Y-%m-%dT%H:%M} to {last:%Y-%m-%dT%H:%M}"
-            + (f" ({skipped} skipped, missing frames)" if skipped else ""),
-        ),
-        (
-            "steps",
-            f"{dataset.input_steps} input, {dataset.forecast_steps} forecast every "
-            f"{_minutes(dataset.time_step)} (lead times {_minutes(lead_times[0])} to "
-            f"{_minutes(lead_times[-1])})",
-        ),
-        ("ensemble", f"{ensemble_size} members, {calls}"),
-        (
-            "batches",
-            f"{n_batches} of {batch_size} cases, {num_workers} workers, device {device}, "
-            f"{'bfloat16 autocast' if precision == 'bf16' else 'float32'}",
-        ),
-    ]
-    logger.info("{} on {} cases:", desc[0].upper() + desc[1:], len(dataset))
-    for key, value in lines:
-        logger.info("  {:10s}: {}", key, value)
+    device_label = str(device)
+    if device.type == "cuda":
+        device_label += f" ({torch.cuda.get_device_name(device)})"
+
+    grid = Table.grid(padding=(0, 2))
+    grid.add_column(justify="right", style="bold cyan")
+    grid.add_column()
+    grid.add_row("Source", escape(f"📂  {dataset._path or 'in-memory dataset'}"))
+    grid.add_row(
+        "Variable",
+        escape(f"💧  {dataset.variable!r}   {dataset.standard_name} [{dataset.units}]"),
+    )
+    grid.add_row(
+        "Domain",
+        f"🗺️   {h:,} × {w:,} px   dx {dataset.dx_km:g} km   ({_describe_domain(dataset)})",
+    )
+    grid.add_row(
+        "Init times",
+        f"📅  {first:%Y-%m-%d %H:%M} → {last:%Y-%m-%d %H:%M}   {n_cases:,} cases"
+        + (f", {skipped:,} skipped (missing frames)" if skipped else ""),
+    )
+    grid.add_row(
+        "Steps",
+        f"🕒  {dataset.input_steps} input + {dataset.forecast_steps} forecast × "
+        f"{_minutes(dataset.time_step)}   lead {_minutes(lead_times[0])} → "
+        f"{_minutes(lead_times[-1])}",
+    )
+    grid.add_row("Model", f"🧠  {_describe_model(model)}")
+    grid.add_row("Ensemble", f"🎲  {ensemble_size} members   {calls}")
+    grid.add_row(
+        "Workload",
+        f"🧮  {n_cases:,} cases × {ensemble_size} members × {dataset.forecast_steps} steps"
+        f" = {n_cases * ensemble_size * dataset.forecast_steps:,} fields of {h:,} × {w:,}",
+    )
+    grid.add_row(
+        "Batches", f"📦  {n_batches:,} × {batch_size} cases   {num_workers} loader workers"
+    )
+    grid.add_row(
+        "Device",
+        f"⚡  {device_label}   {'bfloat16 autocast' if precision == 'bf16' else 'float32'}",
+    )
+    Console(stderr=True).print(
+        Panel(
+            grid,
+            title=f"[bold]🎯 {desc[0].upper() + desc[1:]}[/]",
+            subtitle=f"[dim]{os.path.basename(str(dataset._path))}[/]" if dataset._path else None,
+            border_style="blue",
+            expand=False,
+        )
+    )
 
 
 class _StageTimer:
