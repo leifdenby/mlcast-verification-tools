@@ -11,6 +11,7 @@ import xarray as xr
 
 from . import conventions as cv
 from .scores import crps_ensemble, ensemble_radial_psd, mae, psd_wavelengths, rank_histogram
+from .scores.deterministic import expand_mask
 
 
 class ScoreAccumulator:
@@ -39,6 +40,15 @@ class ScoreAccumulator:
         Seed of the random generator used to break ties in the rank histogram.
     compute_psd : bool
         Whether to compute the radial power spectra.
+    pool_by_init_time : bool
+        If False (default) every case passed to :meth:`update` is kept and each
+        init time may occur only once. If True, cases sharing an init time (e.g. many
+        crops of one forecast, within and across batches) are pooled online into one
+        entry per init time: MAE and CRPS are weighted by the number of valid pixels
+        per lead time (giving the pixel mean over all pooled cases), the rank histogram
+        is the pooled (pixel-count weighted) relative frequency, and the PSDs are the
+        plain mean over the cases with valid pixels. Cases (and lead times) without
+        valid pixels are ignored; scores are NaN where an init time has none.
     """
 
     def __init__(
@@ -52,6 +62,7 @@ class ScoreAccumulator:
         zero_threshold: float = cv.RANK_ZERO_THRESHOLD_MM_H,
         seed: int = 0,
         compute_psd: bool = True,
+        pool_by_init_time: bool = False,
     ) -> None:
         self.forecast_source = str(forecast_source)
         self.lead_times = pd.to_timedelta(np.asarray(lead_times)).values.astype("timedelta64[ns]")
@@ -72,6 +83,10 @@ class ScoreAccumulator:
         }
         self._n_members: int | None = None
         self._grid_shape: tuple[int, int] | None = None
+        self.pool_by_init_time = pool_by_init_time
+        # pooling state: slot index per init time and running sums of shape (slot, T, ...)
+        self._slots: dict[np.datetime64, int] = {}
+        self._sums: dict[str, np.ndarray] = {}
 
     def _generator(self, device: torch.device) -> torch.Generator:
         if device not in self._generators:
@@ -121,9 +136,63 @@ class ScoreAccumulator:
             }
             if self.compute_psd:
                 out[cv.PSD], out[cv.PSD_OBS] = ensemble_radial_psd(fc, obs, mask, self.dx_km)
+            if self.pool_by_init_time:
+                n_valid = expand_mask(mask, obs).sum(dim=(-2, -1))
+        out = {metric: value.detach().cpu().double().numpy() for metric, value in out.items()}
+        if self.pool_by_init_time:
+            self._pool(init_times, out, n_valid.cpu().double().numpy())
+            return
         for metric, value in out.items():
-            self._results[metric].append(value.detach().cpu().double().numpy())
+            self._results[metric].append(value)
         self._init_times.append(init_times)
+
+    def _pool(self, init_times: np.ndarray, out: dict[str, np.ndarray], n: np.ndarray) -> None:
+        """Add the per-case scores `out` (B, T[, ...]) with valid-pixel counts `n` (B, T)."""
+        unique, inverse = np.unique(init_times, return_inverse=True)
+        for it in unique:
+            self._slots.setdefault(it, len(self._slots))
+        slot = np.array([self._slots[it] for it in unique])[inverse.reshape(-1)]
+        valid = n > 0
+        increments = {
+            "n": n,
+            cv.MAE: np.where(valid, out[cv.MAE] * n, 0.0),
+            cv.CRPS: np.where(valid, out[cv.CRPS] * n, 0.0),
+            cv.RANK_HISTOGRAM: np.where(
+                valid[..., None], out[cv.RANK_HISTOGRAM] * n[..., None], 0.0
+            ),
+        }
+        if self.compute_psd:
+            increments["n_psd"] = valid.astype(np.float64)
+            for metric in (cv.PSD, cv.PSD_OBS):
+                increments[metric] = np.where(valid[..., None], out[metric], 0.0)
+        n_slots = len(self._slots)
+        for key, value in increments.items():
+            sums = self._sums.get(key, np.zeros((0, *value.shape[1:])))
+            if len(sums) < n_slots:  # grow geometrically to keep appends amortised O(1)
+                grown = np.zeros((max(n_slots, 2 * len(sums)), *value.shape[1:]))
+                grown[: len(sums)] = sums
+                sums = self._sums[key] = grown
+            np.add.at(sums, slot, value)
+
+    def _pooled_results(self) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+        """Init times and per-init-time scores (N, T[, ...]) from the pooled sums."""
+        n_slots = len(self._slots)
+        init_time = np.array(list(self._slots), dtype="datetime64[ns]")
+        sums = {key: value[:n_slots] for key, value in self._sums.items()}
+
+        def ratio(num: np.ndarray, den: np.ndarray) -> np.ndarray:
+            return np.divide(num, den, out=np.full(num.shape, np.nan), where=den > 0)
+
+        n = sums["n"]
+        results = {
+            cv.MAE: ratio(sums[cv.MAE], n),
+            cv.CRPS: ratio(sums[cv.CRPS], n),
+            cv.RANK_HISTOGRAM: ratio(sums[cv.RANK_HISTOGRAM], n[..., None]),
+        }
+        if self.compute_psd:
+            for metric in (cv.PSD, cv.PSD_OBS):
+                results[metric] = ratio(sums[metric], sums["n_psd"][..., None])
+        return init_time, results
 
     def to_dataset(self) -> xr.Dataset:
         """
@@ -133,17 +202,26 @@ class ScoreAccumulator:
         -------
         xr.Dataset
             Dims ``(forecast_source, init_time, lead_time[, rank | wavelength])`` with
-            ``forecast_source`` of length 1 and ``init_time`` sorted ascending.
+            ``forecast_source`` of length 1 and ``init_time`` sorted ascending (one
+            entry per init time when pooling by init time).
         """
-        if not self._init_times:
-            raise ValueError("no forecast cases have been added")
-        init_time = np.concatenate(self._init_times)
-        if len(np.unique(init_time)) != len(init_time):
-            raise ValueError(f"duplicate init_time in scores of {self.forecast_source!r}")
+        if self.pool_by_init_time:
+            if not self._slots:
+                raise ValueError("no forecast cases have been added")
+            init_time, results = self._pooled_results()
+        else:
+            if not self._init_times:
+                raise ValueError("no forecast cases have been added")
+            init_time = np.concatenate(self._init_times)
+            if len(np.unique(init_time)) != len(init_time):
+                raise ValueError(f"duplicate init_time in scores of {self.forecast_source!r}")
+            results = {
+                metric: np.concatenate(values) for metric, values in self._results.items() if values
+            }
         order = np.argsort(init_time, kind="stable")
 
         def stacked(metric: str) -> np.ndarray:
-            return np.concatenate(self._results[metric])[order][None].astype(np.float64)
+            return results[metric][order][None].astype(np.float64)
 
         case_dims = cv.CASE_DIMS
         attrs = cv.metric_attrs(self.units)

@@ -773,6 +773,151 @@ def test_dataset_from_mlcast_config(data_root, run_dir):
     assert set(few.init_times) <= set(all_times.values)
 
 
+# --- crop mode -----------------------------------------------------------------------------------
+
+
+def test_split_crops(data_root, run_dir):
+    cfg = mi.load_run_config(run_dir / "config.yaml", data_root=data_root)
+    crops, crop_size = mi.split_crops(cfg)
+    assert crop_size == (8, 8)
+    assert list(crops.columns) == ["init_time", "y", "x"]
+    np.testing.assert_array_equal(crops["init_time"].unique(), mi.split_init_times(cfg).values)
+
+    # one row per crop mlcast selects for the test split, at its corner
+    dataset = _test_dataset(cfg)
+    t_abs = dataset.candidates["t"].to_numpy() + dataset._time_index_slice.start
+    times = xr.open_zarr(data_root / "data" / "source.zarr").time.values
+    expected = pd.DataFrame(
+        {
+            "init_time": times[t_abs + INPUT_STEPS - 1],
+            "y": dataset.candidates["y"].to_numpy(),
+            "x": dataset.candidates["x"].to_numpy(),
+        }
+    ).sort_values(["init_time", "y", "x"])
+    np.testing.assert_array_equal(crops.to_numpy(), expected.to_numpy())
+    assert len(crops) > crops["init_time"].nunique()  # several crops per init time
+
+
+def test_dataset_from_mlcast_config_crops(data_root, run_dir):
+    cfg = mi.load_run_config(run_dir / "config.yaml", data_root=data_root)
+    crops, _ = mi.split_crops(cfg)
+    ds = mi.VerificationDataset.from_mlcast_config(cfg, crops=True)
+    assert ds.crop_size == (8, 8) and ds.grid_shape == (8, 8) and ds.grid_coords() == {}
+    assert ds.n_crops == len(crops) and len(ds) == crops["init_time"].nunique()
+    item = ds[0]
+    assert item["input"].shape == (INPUT_STEPS, 1, NY, NX)  # read once per init time
+    first = crops[crops["init_time"] == ds.init_times[0]]
+    np.testing.assert_array_equal(item["crops"].numpy(), first[["y", "x"]].to_numpy())
+
+    few = mi.VerificationDataset.from_mlcast_config(cfg, crops=True, max_cases=3)
+    assert len(few) == 3 and few.n_crops == crops["init_time"].isin(few.init_times).sum()
+    fewer = mi.VerificationDataset.from_mlcast_config(cfg, crops=True, max_crops=5)
+    assert fewer.n_crops == 5
+
+    with pytest.raises(ValueError, match="max_crops needs crops"):
+        mi.VerificationDataset.from_mlcast_config(cfg, max_crops=5)
+    with pytest.raises(ValueError, match="crops and region"):
+        mi.VerificationDataset.from_mlcast_config(cfg, crops=True, region={"y": slice(0, 8)})
+
+
+def test_dataset_crops_errors(source_path):
+    init_times = _valid_init_times(2)
+    crops = pd.DataFrame({"init_time": init_times, "y": [0, 16], "x": [0, 0]})
+    with pytest.raises(ValueError, match="crop_size"):
+        mi.VerificationDataset(source_path, None, INPUT_STEPS, FORECAST_STEPS, crops=crops)
+    with pytest.raises(ValueError, match="extend beyond"):
+        mi.VerificationDataset(
+            source_path, None, INPUT_STEPS, FORECAST_STEPS, crops=crops, crop_size=(16, 8)
+        )
+    with pytest.raises(ValueError, match="init_times is needed"):
+        mi.VerificationDataset(source_path, None, INPUT_STEPS, FORECAST_STEPS)
+
+
+class PersistenceModel(torch.nn.Module):
+    """Deterministic 'ensemble': the last input frame, for every member and lead time."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.scale = torch.nn.Parameter(torch.ones(()))
+
+    def forward(self, x, forecast_steps, ensemble_size=None):
+        last = x[:, -1:] * self.scale  # (B, 1, 1, H, W)
+        return last.expand(-1, forecast_steps, ensemble_size or 1, -1, -1).contiguous()
+
+
+_CROP_KWARGS = {"forecast_source": "convgru", "device": "cpu", "progress": False}
+
+
+def test_verify_crops_equal_region(source_path):
+    """One crop per init time, all at one corner, == that corner as a fixed region."""
+    init_times = _valid_init_times(3)
+    crops = pd.DataFrame({"init_time": init_times, "y": 4, "x": 8})
+    by_crop = mi.VerificationDataset(
+        source_path, None, INPUT_STEPS, FORECAST_STEPS, crops=crops, crop_size=(8, 8)
+    )
+    by_region = mi.VerificationDataset(
+        source_path, init_times, INPUT_STEPS, FORECAST_STEPS,
+        region={"y": slice(4, 12), "x": slice(8, 16)},
+    )  # fmt: skip
+    kwargs = {**_CROP_KWARGS, "ensemble_size": 3, "batch_size": 1}
+    xr.testing.assert_allclose(
+        mi.verify_mlcast_model(AdapterModel(), by_crop, **kwargs),
+        mi.verify_mlcast_model(AdapterModel(), by_region, **kwargs),
+    )
+
+
+def test_verify_crops_pooled(source_path):
+    """Crop scores of an init time are pooled over the valid pixels of all its crops."""
+    init_times = _valid_init_times(2)
+    corners = [(0, 0), (8, 4), (16, 12)]  # (0, 0) is never valid -> fewer valid pixels
+    crops = pd.DataFrame(
+        [(t, y, x) for t in init_times for y, x in corners], columns=["init_time", "y", "x"]
+    )
+    by_crop = mi.VerificationDataset(
+        source_path, None, INPUT_STEPS, FORECAST_STEPS, crops=crops, crop_size=(8, 8)
+    )
+    assert by_crop.n_crops == 6
+    kwargs = {**_CROP_KWARGS, "ensemble_size": 2, "compute_psd": True}
+    pooled = mi.verify_mlcast_model(PersistenceModel(), by_crop, batch_size=2, **kwargs)
+
+    values, weights, psds = [], [], []
+    for y, x in corners:
+        region = {"y": slice(y, y + 8), "x": slice(x, x + 8)}
+        ds = mi.VerificationDataset(
+            source_path, init_times, INPUT_STEPS, FORECAST_STEPS, region=region
+        )
+        scores = mi.verify_mlcast_model(PersistenceModel(), ds, **kwargs)
+        values.append(scores[["mae.tp", "crps.tp"]])
+        weights.append(
+            xr.DataArray([float(ds[i]["mask"].sum()) for i in range(2)], dims="init_time")
+        )
+        psds.append(scores["psd.tp"])
+    weight = xr.concat(weights, "crop").assign_coords(init_time=pooled.init_time)
+    expected = (xr.concat(values, "crop") * weight).sum("crop") / weight.sum("crop")
+    for name in ("mae.tp", "crps.tp"):
+        np.testing.assert_allclose(pooled[name].values, expected[name].values, rtol=1e-6)
+    np.testing.assert_allclose(
+        pooled["psd.tp"].values, xr.concat(psds, "crop").mean("crop").values, rtol=1e-6
+    )
+    np.testing.assert_allclose(pooled["rank_histogram.tp"].sum("rank").values, 1.0)
+    assert pooled.sizes["wavelength"] == 4  # 8-pixel crops
+
+
+def test_verify_mlcast_run_crops(data_root, run_dir):
+    kwargs = _run_kwargs(data_root, max_cases=3, region=None)
+    scores = mi.verify_mlcast_run(
+        run_dir / "config.yaml", run_dir / "checkpoints" / "epoch=0-step=1.ckpt",
+        crops=True, max_crops=7, **kwargs,
+    )  # fmt: skip
+    assert scores.sizes["wavelength"] == 4
+    assert 1 <= scores.sizes[cv.INIT_TIME] <= 3
+    with pytest.raises(ValueError, match="cannot be stored"):
+        mi.forecast_mlcast(
+            run_dir / "config.yaml", run_dir / "checkpoints" / "epoch=0-step=1.ckpt",
+            crops=True, **kwargs,
+        )  # fmt: skip
+
+
 def test_load_mlcast_model(tmp_path):
     NowcastLightningModule = _lightning_module()
     torch.manual_seed(0)
@@ -1087,6 +1232,30 @@ def test_verify_trained_model_cli(data_root, run_dir, monkeypatch):
     with pytest.raises(SystemExit) as exc:
         parser.parse_args(without_config)
     assert exc.value.code == 2
+
+
+def test_verify_trained_model_cli_crops(data_root, run_dir, monkeypatch):
+    from mlcast_verification_tools.cli import main
+    from mlcast_verification_tools.io import open_scores
+
+    monkeypatch.chdir(data_root)
+    case_args = [a for a in _cli_case_args(run_dir) if a not in ("--region-y", "0:16")]
+    case_args = (
+        case_args[: case_args.index("--region-x")] + case_args[case_args.index("--region-x") + 2 :]
+    )
+    out = data_root / "scores.nc"
+    argv = ["verify-trained-model", *case_args, "--crops", "--max-crops", "6", "--out", str(out)]
+    assert main(argv) == 0
+    scores = open_scores(out).load()
+    _check_scores(scores, scores.sizes[cv.INIT_TIME], 3)
+    assert scores.sizes["wavelength"] == 4
+    assert "each of 6 sampled 8x8 crops forecast on its own" in scores.attrs["forecasts"]
+
+    with pytest.raises(SystemExit, match="--region"):
+        main([*argv[:-2], "--region-y", "0:8", "--out", str(out)])
+    no_crops = [a for a in argv if a != "--crops"]
+    with pytest.raises(SystemExit, match="--max-crops needs --crops"):
+        main(no_crops)
 
 
 def test_forecast_then_score_cli_equals_verify_cli(data_root, run_dir, monkeypatch):
