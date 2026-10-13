@@ -162,7 +162,20 @@ the window. Several crops at the same time give one case. Each case is then fore
 the **full radar domain** (or a fixed `--region-y/--region-x`), because a score file
 holds one value per source, init time and lead time.
 
-`--max-cases N` evenly subsamples the init times for a quick run. `--forecast-steps`
+Before the first batch the cases are summarised in the log (source, domain, init times,
+steps, ensemble, batching), and the progress bar shows the mean time per batch spent
+waiting for data, in the model and in the scores. The cost per case is dominated by the
+model: every case is a full-domain forecast for every member and lead time, so the run
+time scales with cases × members × lead times × grid size. To make it faster:
+
+- `--max-cases N` evenly subsamples the init times; consecutive init times are strongly
+  correlated, so a few thousand cases give nearly the same scores as every init time.
+- `--precision bf16` runs the model under bfloat16 autocast, about twice as fast on
+  GPUs with bf16 tensor cores (A100, H100); the forecasts are scored in float32.
+- `--num-workers 2` to `4` overlaps reading the source data with the GPU; more workers
+  do not help when the model dominates.
+
+`--forecast-steps`
 unrolls the model beyond its training horizon. `examples/mlcast_gpu.py` shows both
 paths end to end. To score arbitrary init times instead of the test split, build
 `VerificationDataset(source, init_times, input_steps, forecast_steps)` and pass it to

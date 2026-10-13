@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import re
 
 import numpy as np
 import pandas as pd
@@ -402,6 +403,65 @@ def test_verify_member_chunks(source_path):
         progress=False,
     )
     _check_scores(scores, 3, 5, psd=False)
+
+
+def test_verify_bf16_autocast(source_path):
+    """bf16 autocast gives float32 forecasts and scores close to (not equal to) fp32."""
+    ds = mi.VerificationDataset(source_path, _valid_init_times(3), INPUT_STEPS, FORECAST_STEPS)
+    kwargs = {"forecast_source": "convgru", "ensemble_size": 3, "device": "cpu", "progress": False}
+    fp32 = mi.verify_mlcast_model(AdapterModel(), ds, **kwargs)
+    bf16 = mi.verify_mlcast_model(AdapterModel(), ds, precision="bf16", **kwargs)
+    _check_scores(bf16, 3, 3)
+    assert not np.array_equal(bf16["mae.tp"].values, fp32["mae.tp"].values)
+    np.testing.assert_allclose(bf16["mae.tp"].values, fp32["mae.tp"].values, rtol=0.2, atol=0.05)
+    with pytest.raises(ValueError, match="precision"):
+        mi.verify_mlcast_model(AdapterModel(), ds, precision="fp16", **kwargs)
+
+
+def test_verify_logs_cases(source_path):
+    from loguru import logger
+
+    ds = mi.VerificationDataset(
+        source_path, _valid_init_times(3), INPUT_STEPS, FORECAST_STEPS,
+        region={"y": slice(0, 8)},
+    )  # fmt: skip
+    messages: list[str] = []
+    sink = logger.add(messages.append, format="{message}", level="INFO")
+    try:
+        mi.verify_mlcast_model(
+            AdapterModel(), ds, forecast_source="convgru", ensemble_size=5, member_chunk=2,
+            batch_size=2, compute_psd=False, device="cpu", precision="bf16", progress=False,
+        )  # fmt: skip
+    finally:
+        logger.remove(sink)
+    text = "".join(messages)
+    assert "Verifying convgru on 3 cases:" in text
+    assert f"8 x {ds.grid_shape[1]} pixels (sub-domain y=0:8)" in text
+    assert f"{INPUT_STEPS} input, {FORECAST_STEPS} forecast every 5 min" in text
+    assert "5 members, 2 model calls of 2/3 members per batch" in text
+    assert "2 of 2 cases, 0 workers, device cpu, bfloat16 autocast" in text
+    assert re.search(r"Verifying convgru done: 3 cases in 0:00:\d\d \(", text)
+
+
+def test_verify_progress_shows_stage_times(source_path, monkeypatch):
+    from tqdm.auto import tqdm
+
+    ds = mi.VerificationDataset(source_path, _valid_init_times(2), INPUT_STEPS, FORECAST_STEPS)
+    postfixes = []
+    original = tqdm.set_postfix_str
+
+    def record(self, s="", refresh=True):
+        postfixes.append(s)
+        return original(self, s, refresh=refresh)
+
+    monkeypatch.setattr(tqdm, "set_postfix_str", record)
+    scores = mi.verify_mlcast_model(
+        AdapterModel(), ds, forecast_source="convgru", ensemble_size=2, batch_size=1,
+        compute_psd=False, device="cpu", progress=True,
+    )  # fmt: skip
+    _check_scores(scores, 2, 2, psd=False)
+    assert len(postfixes) == 2
+    assert re.fullmatch(r"data \d+\.\d\ds model \d+\.\d\ds score \d+\.\d\ds", postfixes[-1])
 
 
 @pytest.mark.timeout(120)

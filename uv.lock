@@ -2855,6 +2855,7 @@ gpu-cu130 = [
     { name = "torchvision", version = "0.29.1+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" } },
 ]
 mlcast = [
+    { name = "loguru" },
     { name = "mlcast" },
     { name = "pytorch-lightning" },
 ]
@@ -2871,6 +2872,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "loguru", marker = "extra == 'mlcast'", specifier = ">=0.7" },
     { name = "matplotlib", specifier = ">=3.8" },
     { name = "mlcast", marker = "extra == 'mlcast'", git = "https://github.com/mlcast-community/mlcast?branch=main" },
     { name = "netcdf4", specifier = ">=1.6" },

@@ -23,6 +23,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `--precision bf16` for `verify-trained-model` / `forecast-trained-model` (`precision=`
+  in `verify_mlcast_model`, `verify_mlcast_run` and `forecast_mlcast`): runs the model
+  under bfloat16 autocast, about twice as fast on GPUs with bf16 tensor cores; the
+  forecasts are cast back to float32 before they are de-normalised and scored.
+- Log output (loguru) describing what is verified: the test split's crops and unique
+  init times, the loaded model, and before the first batch the source, domain, init
+  times, steps, ensemble and batching; the elapsed time per case at the end. The
+  progress bar shows the mean time per batch spent waiting for data, in the model and
+  in the scores (or writing the forecasts).
+- `VerificationDataset.grid_shape`.
+
 - Verification of mlcast models trained on radar reflectivity
   (`equivalent_reflectivity_factor`, dBZ): forecasts are de-normalised to dBZ, the
   observations are clipped to mlcast's `[dbz_floor, dbz_ceiling]`, and the rank-histogram

@@ -54,6 +54,7 @@ optional-dependencies.gpu-cu130 = [
 ]
 # scoring trained mlcast models on the fly; combine with one of the torch extras
 optional-dependencies.mlcast = [
+  "loguru>=0.7",
   "mlcast",
   "pytorch-lightning>=2",
 ]

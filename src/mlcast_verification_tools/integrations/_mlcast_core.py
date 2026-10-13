@@ -7,10 +7,13 @@ sub-command) does not import torch or mlcast. Import from the public module.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
+import datetime
 import math
 import os
 import pathlib
+import time
 import warnings
 from collections.abc import Iterator, Sequence
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -19,13 +22,14 @@ import numpy as np
 import pandas as pd
 import torch
 import xarray as xr
+from loguru import logger
 from mlcast.data.normalization import DEFAULT_SCALING, ReflectivityScaling
 from torch.utils.data import DataLoader, Dataset
 
 from .. import conventions as cv
 from ..accumulator import ScoreAccumulator
 from ..units import default_zero_threshold, mm_per_hour_factor  # noqa: F401 - re-exported
-from .mlcast import SUPPORTED_STANDARD_NAMES
+from .mlcast import PRECISIONS, SUPPORTED_STANDARD_NAMES
 
 if TYPE_CHECKING:  # pragma: no cover
     import fiddle as fdl
@@ -387,7 +391,14 @@ def split_init_times(
     times = pd.DatetimeIndex(ds.indexes[dataset.t_dim])
     if len(t_init) and t_init[-1] >= len(times):
         raise ValueError("sampling index refers to times beyond the source Zarr")
-    return pd.DatetimeIndex(times[t_init]).unique().sort_values()
+    init_times = pd.DatetimeIndex(times[t_init]).unique().sort_values()
+    logger.info(
+        "{} split: {} sampled crops at {} unique init times",
+        split,
+        len(candidates),
+        len(init_times),
+    )
+    return init_times
 
 
 def load_mlcast_model(
@@ -448,6 +459,13 @@ def load_mlcast_model(
         map_location=torch.device(device),
         strict=True,
         weights_only=False,
+    )
+    n_params = sum(p.numel() for p in model.parameters())
+    logger.info(
+        "Loaded {} ({:.1f}M parameters) from {}",
+        type(network).__name__,
+        n_params / 1e6,
+        checkpoint_path,
     )
     return model.to(device).eval()
 
@@ -706,6 +724,11 @@ class VerificationDataset(Dataset):
                 raise ValueError("max_cases must be at least 1")
             if max_cases < len(init_times):
                 pick = np.unique(np.linspace(0, len(init_times) - 1, max_cases).round().astype(int))
+                logger.info(
+                    "Subsampling evenly to {} of the {} init times (max_cases)",
+                    len(pick),
+                    len(init_times),
+                )
                 init_times = init_times[pick]
         return cls(
             factory.zarr_path,
@@ -802,6 +825,17 @@ class VerificationDataset(Dataset):
             "timedelta64[ns]"
         )
 
+    @property
+    def grid_shape(self) -> tuple[int, int]:
+        """``(H, W)`` of the verification domain (region applied)."""
+        shape = []
+        for name, dim in (("y", self.y_dim), ("x", self.x_dim)):
+            size = self.ds.sizes[dim]
+            if name in self.region:
+                size = len(range(*self.region[name].indices(size)))
+            shape.append(size)
+        return shape[0], shape[1]
+
     def grid_coords(self) -> dict[str, xr.Variable]:
         """
         The ``y``/``x`` coordinates of the verification domain (region applied).
@@ -889,13 +923,30 @@ def _member_chunks(ensemble_size: int, member_chunk: int | None) -> list[int]:
     return chunks
 
 
-def _forecast(model, x: torch.Tensor, forecast_steps: int, chunks: list[int]) -> torch.Tensor:
-    """Run the model for all members, ``(B, T, M, H, W)`` normalised."""
+def _check_precision(precision: str) -> None:
+    if precision not in PRECISIONS:
+        raise ValueError(f"precision must be one of {PRECISIONS}, got {precision!r}")
+
+
+def _autocast(device: torch.device, precision: str):
+    """``torch.autocast`` to bfloat16 for ``"bf16"``, a no-op context for ``"fp32"``."""
+    _check_precision(precision)
+    if precision == "fp32":
+        return contextlib.nullcontext()
+    return torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+
+
+def _forecast(
+    model, x: torch.Tensor, forecast_steps: int, chunks: list[int], precision: str = "fp32"
+) -> torch.Tensor:
+    """Run the model for all members, ``(B, T, M, H, W)`` normalised, float32."""
     b, _, _, h, w = x.shape
     preds = None
     start = 0
     for k in chunks:
-        out = model(x, forecast_steps=forecast_steps, ensemble_size=k)
+        with _autocast(x.device, precision):
+            out = model(x, forecast_steps=forecast_steps, ensemble_size=k)
+        out = out.float()  # no-op in fp32; de-normalisation and scores run in float32
         if out.shape[2] != k:
             raise ValueError(
                 f"model returned {out.shape[2]} channels for {k} members; only single-variable "
@@ -923,6 +974,7 @@ def verify_mlcast_model(
     seed: int = 0,
     compute_psd: bool = True,
     member_chunk: int | None = None,
+    precision: str = "fp32",
     progress: bool = True,
 ) -> xr.Dataset:
     """
@@ -962,8 +1014,14 @@ def verify_mlcast_model(
         Generate the members in model calls of at most this many members (at least 2)
         to lower the peak activation memory. The encoder is re-run for each call and
         the full ``(B, T, M, H, W)`` forecast is still assembled on the device.
+    precision : {"fp32", "bf16"}
+        Run the model in float32, or under ``torch.autocast`` to bfloat16 (about twice
+        as fast on GPUs with bf16 tensor cores). The forecast is cast to float32 before
+        it is de-normalised and scored either way.
     progress : bool
-        Show a tqdm progress bar.
+        Show a tqdm progress bar, with the mean time per batch spent waiting for data,
+        in the model (including the transfer to the device and de-normalisation) and
+        in the scores. The timing synchronises CUDA once per stage and batch.
 
     Returns
     -------
@@ -989,8 +1047,10 @@ def verify_mlcast_model(
         num_workers=num_workers,
         seed=seed,
         member_chunk=member_chunk,
+        precision=precision,
         progress=progress,
         desc=f"verifying {forecast_source}",
+        consumer="score",
     )
     with torch.inference_mode():
         for preds, obs, mask, init_times in batches:
@@ -1009,8 +1069,10 @@ def _iter_forecasts(
     num_workers: int = 0,
     seed: int = 0,
     member_chunk: int | None = None,
+    precision: str = "fp32",
     progress: bool = True,
     desc: str = "forecasting",
+    consumer: str = "score",
 ) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor, np.ndarray]]:
     """
     Run the model over the cases of `dataset`, batch by batch.
@@ -1018,6 +1080,10 @@ def _iter_forecasts(
     Seeds torch's global RNG with `seed` before the first batch, so the same
     arguments give the same ensemble. Each batch is computed in inference mode;
     consumers that modify the tensors in place should also run in inference mode.
+
+    With `progress`, the progress bar shows the mean time per batch spent waiting for
+    the DataLoader (``data``), in the model (``model``) and in the consumer of the
+    yielded tensors (labelled `consumer`, the time until the next batch is requested).
 
     Yields
     ------
@@ -1031,6 +1097,7 @@ def _iter_forecasts(
     init_times : np.ndarray
         ``datetime64[ns]`` init times of the B cases.
     """
+    _check_precision(precision)
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     model = model.to(device).eval()
     chunks = _member_chunks(ensemble_size, member_chunk)
@@ -1049,16 +1116,34 @@ def _iter_forecasts(
         **worker_kwargs,
     )
     batches = loader
+    bar = None
     if progress:
         try:
             from tqdm.auto import tqdm
 
-            batches = tqdm(loader, desc=desc, unit="batch")
+            batches = bar = tqdm(loader, desc=desc, unit="batch")
         except ImportError:  # pragma: no cover
             pass
+    timer = _StageTimer(device, ("data", "model", consumer)) if bar is not None else None
 
+    _log_cases(
+        dataset,
+        desc=desc,
+        ensemble_size=ensemble_size,
+        chunks=chunks,
+        batch_size=batch_size,
+        n_batches=len(loader),
+        num_workers=num_workers,
+        device=device,
+        precision=precision,
+    )
+    started = time.perf_counter()
     torch.manual_seed(seed)  # also seeds all CUDA devices
+    if timer:
+        timer.start()
     for batch in batches:
+        if timer:
+            timer.lap("data")
         with torch.inference_mode():
             x = batch["input"].to(device, non_blocking=True)
             mask = batch["mask"].to(device, non_blocking=True)
@@ -1066,12 +1151,106 @@ def _iter_forecasts(
             obs = torch.nan_to_num(obs, nan=0.0)  # NaN obs are outside `mask`
             init_times = batch["init_time"].numpy().astype("datetime64[ns]")
 
-            preds = _forecast(model, x, dataset.forecast_steps, chunks)
+            preds = _forecast(model, x, dataset.forecast_steps, chunks, precision)
             preds = preds.clamp_(scaling.norm_min, scaling.norm_max)
             preds = denormalize_torch(preds, dataset.standard_name, scaling)
             del x
+        if timer:
+            timer.lap("model")
         yield preds, obs, mask, init_times
         del preds, obs, mask
+        if timer:
+            timer.lap(consumer)
+            bar.set_postfix_str(timer.summary(), refresh=False)
+    elapsed = time.perf_counter() - started
+    logger.info(
+        "{} done: {} cases in {} ({:.2f} s/case{})",
+        desc[0].upper() + desc[1:],
+        len(dataset),
+        datetime.timedelta(seconds=round(elapsed)),
+        elapsed / len(dataset),
+        f"; per batch: {timer.summary()}" if timer else "",
+    )
+
+
+def _minutes(td: pd.Timedelta) -> str:
+    return f"{td.total_seconds() / 60:g} min"
+
+
+def _log_cases(
+    dataset: VerificationDataset,
+    *,
+    desc: str,
+    ensemble_size: int,
+    chunks: list[int],
+    batch_size: int,
+    n_batches: int,
+    num_workers: int,
+    device: torch.device,
+    precision: str,
+) -> None:
+    """Log what is about to be forecast, in the style of mlcast's data module summary."""
+    h, w = dataset.grid_shape
+    first, last = (pd.Timestamp(t) for t in dataset.init_times[[0, -1]])
+    skipped = len(dataset.skipped_init_times)
+    lead_times = pd.to_timedelta(dataset.lead_times)
+    calls = (
+        "one model call per batch"
+        if len(chunks) == 1
+        else f"{len(chunks)} model calls of {'/'.join(map(str, chunks))} members per batch"
+    )
+    lines = [
+        ("source", f"{dataset._path or 'in-memory dataset'}"),
+        ("variable", f"{dataset.variable!r} ({dataset.standard_name}, {dataset.units})"),
+        ("domain", f"{h} x {w} pixels ({_describe_domain(dataset)}), dx {dataset.dx_km:g} km"),
+        (
+            "init times",
+            f"{len(dataset)} from {first:%Y-%m-%dT%H:%M} to {last:%Y-%m-%dT%H:%M}"
+            + (f" ({skipped} skipped, missing frames)" if skipped else ""),
+        ),
+        (
+            "steps",
+            f"{dataset.input_steps} input, {dataset.forecast_steps} forecast every "
+            f"{_minutes(dataset.time_step)} (lead times {_minutes(lead_times[0])} to "
+            f"{_minutes(lead_times[-1])})",
+        ),
+        ("ensemble", f"{ensemble_size} members, {calls}"),
+        (
+            "batches",
+            f"{n_batches} of {batch_size} cases, {num_workers} workers, device {device}, "
+            f"{'bfloat16 autocast' if precision == 'bf16' else 'float32'}",
+        ),
+    ]
+    logger.info("{} on {} cases:", desc[0].upper() + desc[1:], len(dataset))
+    for key, value in lines:
+        logger.info("  {:10s}: {}", key, value)
+
+
+class _StageTimer:
+    """Mean wall time per batch of named stages, synchronising CUDA at each lap."""
+
+    def __init__(self, device: torch.device, stages: Sequence[str]) -> None:
+        self.device = device
+        self.totals = dict.fromkeys(stages, 0.0)
+        self.n_batches = 0
+        self._last = 0.0
+
+    def start(self) -> None:
+        self._last = time.perf_counter()
+
+    def lap(self, stage: str) -> None:
+        """Add the time since the previous lap (or start) to `stage`."""
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        now = time.perf_counter()
+        self.totals[stage] += now - self._last
+        self._last = now
+        if stage == next(reversed(self.totals)):
+            self.n_batches += 1
+
+    def summary(self) -> str:
+        n = max(self.n_batches, 1)
+        return " ".join(f"{stage} {total / n:.2f}s" for stage, total in self.totals.items())
 
 
 # ---------------------------------------------------------------------------
@@ -1167,18 +1346,22 @@ def _prepare_run(
     )
 
 
-def _describe_forecasts(run: _Run, ensemble_size: int) -> str:
+def _describe_domain(dataset: VerificationDataset) -> str:
+    if not dataset.region:
+        return "full domain"
+    return "sub-domain " + ", ".join(
+        f"{k}={'' if s.start is None else s.start}:{'' if s.stop is None else s.stop}"
+        for k, s in dataset.region.items()
+    )
+
+
+def _describe_forecasts(run: _Run, ensemble_size: int, precision: str = "fp32") -> str:
     dataset = run.dataset
     first, last = (pd.Timestamp(t) for t in dataset.init_times[[0, -1]])
-    if dataset.region:
-        domain = "sub-domain " + ", ".join(
-            f"{k}={'' if s.start is None else s.start}:{'' if s.stop is None else s.stop}"
-            for k, s in dataset.region.items()
-        )
-    else:
-        domain = "full domain"
+    domain = _describe_domain(dataset)
+    autocast = ", run with bfloat16 autocast" if precision == "bf16" else ""
     return (
-        f"{run.forecast_source}: mlcast model {run.checkpoint.name}, "
+        f"{run.forecast_source}: mlcast model {run.checkpoint.name}{autocast}, "
         f"{ensemble_size}-member ensemble from {dataset.input_steps} input frames, "
         f"{domain} at the {len(dataset)} init times of the {run.split} split's sampled "
         f"crops ({first:%Y-%m-%dT%H:%M} to {last:%Y-%m-%dT%H:%M}) of {run.config_label}"
@@ -1203,6 +1386,7 @@ def forecast_mlcast(
     batch_size: int = 1,
     num_workers: int = 0,
     member_chunk: int | None = None,
+    precision: str = "fp32",
     seed: int = 0,
     out: str | os.PathLike | None = None,
     progress: bool = True,
@@ -1229,7 +1413,8 @@ def forecast_mlcast(
     ensemble_size : int
         Number of members.
     split, max_cases, forecast_steps, region, data_root, zarr_path, index_path, \
-storage_options, forecast_source, device, batch_size, num_workers, member_chunk, seed, progress
+storage_options, forecast_source, device, batch_size, num_workers, member_chunk, precision, \
+seed, progress
         See :func:`verify_mlcast_run`.
     out : str or os.PathLike, optional
         Zarr store to write the forecasts to, batch by batch (appending along
@@ -1268,6 +1453,7 @@ storage_options, forecast_source, device, batch_size, num_workers, member_chunk,
         batch_size=batch_size,
         num_workers=num_workers,
         member_chunk=member_chunk,
+        precision=precision,
         seed=seed,
         out=out,
         progress=progress,
@@ -1281,6 +1467,7 @@ def _forecast_run(
     batch_size: int,
     num_workers: int,
     member_chunk: int | None,
+    precision: str,
     seed: int,
     out: str | os.PathLike | None,
     progress: bool,
@@ -1296,12 +1483,13 @@ def _forecast_run(
     var_attrs = _variable_attrs(dataset.standard_name, dataset.units)
     attrs = {
         "title": f"Forecasts of {run.forecast_source} ({run.split} split)",
-        "forecasts": _describe_forecasts(run, ensemble_size),
+        "forecasts": _describe_forecasts(run, ensemble_size, precision),
         "truth": _describe_truth(dataset),
         "checkpoint": str(run.checkpoint),
         "config": run.config_label,
         "split": run.split,
         "ensemble_size": int(ensemble_size),
+        "precision": precision,
         "seed": int(seed),
     }
 
@@ -1323,8 +1511,10 @@ def _forecast_run(
         num_workers=num_workers,
         seed=seed,
         member_chunk=member_chunk,
+        precision=precision,
         progress=progress,
         desc=f"forecasting {run.forecast_source}",
+        consumer="write",
     )
     with torch.inference_mode():
         for preds, _obs, mask, init_times in batches:
@@ -1463,6 +1653,7 @@ def verify_mlcast_run(
     seed: int = 0,
     compute_psd: bool = True,
     member_chunk: int | None = None,
+    precision: str = "fp32",
     progress: bool = True,
     **dataset_kwargs: Any,
 ) -> xr.Dataset:
@@ -1503,7 +1694,7 @@ def verify_mlcast_run(
         Where to find the data, see :func:`load_run_config`.
     region : dict, optional
         Fixed sub-domain instead of the full domain, see :class:`VerificationDataset`.
-    num_workers, seed, compute_psd, member_chunk, progress
+    num_workers, seed, compute_psd, member_chunk, precision, progress
         See :func:`verify_mlcast_model`.
     **dataset_kwargs
         Passed to :class:`VerificationDataset` (``on_missing``, ``zero_threshold``, ...).
@@ -1540,6 +1731,7 @@ def verify_mlcast_run(
         seed=seed,
         compute_psd=compute_psd,
         member_chunk=member_chunk,
+        precision=precision,
         progress=progress,
     )
 
@@ -1597,13 +1789,14 @@ def verify_trained_model_from_args(args: argparse.Namespace) -> int:
         seed=args.seed,
         compute_psd=not args.no_psd,
         member_chunk=args.member_chunk,
+        precision=args.precision,
         progress=not args.no_progress,
     )
     path = write_scores(
         scores,
         args.out,
         title=args.title or f"Verification scores of {run.forecast_source} ({args.split} split)",
-        forecasts=args.forecasts or _describe_forecasts(run, args.ensemble_size),
+        forecasts=args.forecasts or _describe_forecasts(run, args.ensemble_size, args.precision),
         truth=args.truth or _describe_truth(run.dataset),
         created_by=args.created_by,
         created_with=args.created_with,
@@ -1636,6 +1829,7 @@ def forecast_trained_model_from_args(args: argparse.Namespace) -> int:
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         member_chunk=args.member_chunk,
+        precision=args.precision,
         seed=args.seed,
         out=args.out,
         progress=not args.no_progress,

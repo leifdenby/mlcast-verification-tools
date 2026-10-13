@@ -105,6 +105,10 @@ if TYPE_CHECKING:  # pragma: no cover - for type checkers/IDEs; imported lazily 
 #: mlcast normalises through its Z-R relation, and reflectivities in dBZ.
 SUPPORTED_STANDARD_NAMES = ("rainfall_rate", "rainfall_flux", "equivalent_reflectivity_factor")
 
+#: Precisions the model can be run in: ``fp32`` (default) or ``bf16`` (``torch.autocast``
+#: to bfloat16; the forecast is cast back to float32 before de-normalisation).
+PRECISIONS = ("fp32", "bf16")
+
 _LAZY = (
     "VerificationDataset",
     "denormalize_torch",
@@ -121,6 +125,7 @@ _LAZY = (
 )
 
 __all__ = [  # noqa: RUF022 - grouped: light helpers first, then the lazily imported API
+    "PRECISIONS",
     "SUPPORTED_STANDARD_NAMES",
     "build_forecast_trained_model_parser",
     "build_verify_trained_model_parser",
@@ -190,6 +195,13 @@ def _add_run_arguments(parser: argparse.ArgumentParser, action: str) -> None:
         "--member-chunk", type=int, help="generate members in calls of at most this many (>= 2)"
     )
     g.add_argument("--device", help="torch device (default: cuda if available, else cpu)")
+    g.add_argument(
+        "--precision",
+        choices=PRECISIONS,
+        default="fp32",
+        help="run the model in float32 (default) or with bfloat16 autocast "
+        "(about twice as fast on GPUs with bf16 tensor cores, e.g. A100/H100)",
+    )
     g.add_argument("--seed", type=int, default=0)
 
     g = parser.add_argument_group("data (default: from the run config)")
@@ -223,7 +235,13 @@ def _add_run_arguments(parser: argparse.ArgumentParser, action: str) -> None:
     g.add_argument("--region-x", type=_parse_slice, help="x index range start:stop")
     g.add_argument("--on-missing", choices=("skip", "raise"), default="skip")
     g.add_argument("--batch-size", type=int, default=1)
-    g.add_argument("--num-workers", type=int, default=0)
+    g.add_argument(
+        "--num-workers",
+        type=int,
+        default=0,
+        help="DataLoader worker processes reading the source data (default: 0, i.e. read "
+        "in the main process); a few (2-4) suffice to overlap reading with the GPU",
+    )
 
 
 def build_verify_trained_model_parser(
