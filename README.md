@@ -4,13 +4,69 @@ Verification scores and plots for precipitation nowcasts, reproducing the verifi
 figures of the IRENE paper ([arXiv:2609.17175](https://arxiv.org/html/2609.17175v1)),
 with the MLCast `verification/forecast_scoring_metrics` format (spec v0.1.0,
 [mlcast-dataset-validator](https://github.com/leifdenby/mlcast-dataset-validator)) as
-the intermediate file between scoring and plotting:
+the intermediate file between scoring and plotting.
 
+Scores can be computed in two ways, the second with two sources of forecasts:
+
+```mermaid
+flowchart LR
+    radar[("radar source data<br/>(inputs and truth)")]
+    train["mlcast train --config ..."]
+    model["trained mlcast model<br/>config.yaml + checkpoint"]
+
+    split["test split of config.yaml<br/>(init times = cases)"]
+
+    radar -->|"provides training samples to"| train
+    train -->|writes| model
+    model -->|"defines"| split
+
+    subgraph A["a) on the fly: mlcast verify-trained-model"]
+        direction LR
+        fa["forecast a batch<br/>(GPU, in memory)"] -->|"passes forecasts to"| sa["score the batch<br/>(GPU)"]
+    end
+
+    subgraph B["b) forecast to disk, then score"]
+        direction LR
+        subgraph B1["b1) mlcast model"]
+            fb1["mlcast forecast-trained-model"] -->|writes| fz1[("forecasts.zarr")]
+        end
+        subgraph B2["b2) any other model"]
+            fz2[("forecasts.zarr / .nc<br/>in the same layout")]
+        end
+        fz1 -->|"is read by"| sb["mlcast.verify score<br/>(CPU/GPU)"]
+        fz2 -->|"is read by"| sb
+    end
+
+    model -->|"is loaded by"| fa
+    split -->|"selects the cases for"| fa
+    radar -->|"provides inputs to"| fa
+    radar -->|"provides truth to"| sa
+    model -->|"is loaded by"| fb1
+    split -->|"selects the cases for"| fb1
+    radar -->|"provides inputs to"| fb1
+    radar -->|"provides truth to"| sb
+
+    sa -->|writes| scores[("scores.zarr / .nc<br/>one value per<br/>source × case × lead time<br/>(spec-valid)")]
+    sb -->|writes| scores
+    scores -->|"is plotted by mlcast.verify plot as"| plots["figures"]
 ```
-forecasts + radar ──(torch, CPU/GPU)──▶ per-case scores ──▶ scores.zarr / .nc ──▶ plots
-  (on disk, or produced on the fly       (one value per            (spec-valid)
-   by a trained mlcast model)             source × case × lead time)
-```
+
+- **a) On the fly** never stores the forecasts: each batch of cases is forecast and
+  scored on the GPU and then discarded. It is the cheapest path for an mlcast model, and
+  the only one that can also score the persistence baseline in the same pass and score
+  test crops (`--crops`).
+- **b) Forecast to disk, then score** keeps the forecasts, so they can be inspected and
+  re-scored. The truth is any radar dataset on the same grid, e.g. an mlcast source
+  dataset that passes
+  [mlcast-dataset-validator](https://github.com/leifdenby/mlcast-dataset-validator).
+  - **b1)** forecasts of a trained mlcast model, written by
+    `mlcast forecast-trained-model`.
+  - **b2)** forecasts of any other model, as long as they have the layout described
+    under [Usage](#usage) (`ds_forecasts`). The validator has no spec for forecast
+    datasets yet, so the forecast layout is defined by this package for now.
+
+For an mlcast model, a) and b1) give the same scores for the same cases, ensemble size
+and seed.
 
 ## What is a "case"?
 
@@ -99,21 +155,21 @@ from mlcast_verification_tools.plots import plot_all
 config = load_run_config("logs/mlcast/version_3/config.yaml")  # the run's training config
 checkpoint = "logs/mlcast/version_3/checkpoints/best.ckpt"
 
-# a) forecast first (written to Zarr batch by batch), then score
+# a) forecast and score on the fly on the GPU, never storing the forecasts
+scores = verify_mlcast_run(config, checkpoint, ensemble_size=20)
+
+# b1) or forecast to disk first (written to Zarr batch by batch), then score
 ds_forecasts = forecast_mlcast(config, checkpoint, ensemble_size=20, out="forecasts.zarr")
 ds_truth = open_truth(config)                     # the run's radar data, in its own units
 scores = compute_scores(ds_forecasts, ds_truth)  # on the GPU if available
-
-# b) or forecast and score on the fly on the GPU, never storing the forecasts
-scores = verify_mlcast_run(config, checkpoint, ensemble_size=20)
 
 path = write_scores(scores, "scores.zarr", title="...", forecasts="...", truth="...")
 validate_scores(path).console_print()
 plot_all(scores, "figures/")
 ```
 
-Both paths give the same scores for the same arguments and seed. Forecasts of other
-models can be scored in the same way, by building `ds_forecasts` yourself:
+a) and b1) give the same scores for the same arguments and seed. Forecasts of other
+models are scored like b1) (path b2), by building `ds_forecasts` yourself:
 
 - `ds_forecasts`: a data variable (default `tp`, choose with `variable=`) with dims
   `(forecast_source, init_time, lead_time, member, y, x)` and a `units` attribute.
@@ -135,14 +191,17 @@ directory training was started from, because the config's data paths (e.g.
 ```bash
 RUN=logs/mlcast/version_3
 
-# a) forecast, then score
+# a) on the fly
+mlcast verify-trained-model --config $RUN/config.yaml --checkpoint $RUN/checkpoints/best.ckpt \
+    --out scores.zarr
+
+# b1) or forecast to disk, then score
 mlcast forecast-trained-model --config $RUN/config.yaml --checkpoint $RUN/checkpoints/best.ckpt \
     --out forecasts.zarr
 mlcast.verify score forecasts.zarr --truth-from-config $RUN/config.yaml --out scores.zarr
 
-# b) or on the fly
-mlcast verify-trained-model --config $RUN/config.yaml --checkpoint $RUN/checkpoints/best.ckpt \
-    --out scores.zarr
+# b2) forecasts of another model, against a truth dataset on the same grid
+mlcast.verify score other_forecasts.zarr --truth radar.zarr --out scores_other.zarr
 
 mlcast.verify plot scores.zarr --out figures/
 ```
