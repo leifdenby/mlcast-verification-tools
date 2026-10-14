@@ -1302,6 +1302,44 @@ def test_verify_trained_model_cli(data_root, run_dir, monkeypatch):
     assert exc.value.code == 2
 
 
+@pytest.mark.parametrize("crops", [False, True])
+def test_verify_trained_model_cli_multi_device(data_root, run_dir, monkeypatch, crops):
+    """`--devices 2` (two CPU processes) scores the same cases as one process."""
+    import subprocess
+    import sys
+
+    from mlcast_verification_tools.cli import main
+    from mlcast_verification_tools.io import open_scores
+
+    monkeypatch.chdir(data_root)
+    case_args = _cli_case_args(run_dir)
+    if crops:  # full domain, scored on the crops
+        case_args = case_args[: case_args.index("--region-y")] + ["--crops", "--no-progress"]
+    single = data_root / "single.nc"
+    assert main(["verify-trained-model", *case_args, "--out", str(single)]) == 0
+    multi = data_root / "multi.nc"
+    # Fabric re-runs the command line for the second process, so not from within pytest
+    cmd = [sys.executable, "-m", "mlcast_verification_tools.cli", "verify-trained-model",
+           *case_args, "--devices", "2", "--out", str(multi)]  # fmt: skip
+    subprocess.run(cmd, cwd=data_root, check=True, timeout=600)
+
+    got, expected = open_scores(multi).load(), open_scores(single).load()
+    _check_scores(got, expected.sizes[cv.INIT_TIME], 3)
+    np.testing.assert_array_equal(got[cv.INIT_TIME].values, expected[cv.INIT_TIME].values)
+    # persistence is deterministic, except the rank histogram's random tie breaking, which
+    # (like the model's ensemble) is seeded per process
+    deterministic = [name for name in got.data_vars if not name.startswith(cv.RANK_HISTOGRAM)]
+    xr.testing.assert_allclose(
+        got[deterministic].sel({cv.FORECAST_SOURCE: "persistence"}),
+        expected[deterministic].sel({cv.FORECAST_SOURCE: "persistence"}),
+    )
+    assert "scored in 2 processes" in got.attrs["forecasts"]
+
+    with pytest.raises(SystemExit, match="only the device type"):
+        main(["verify-trained-model", *case_args, "--device", "cuda:1", "--devices", "2",
+              "--out", str(multi)])  # fmt: skip
+
+
 def test_verify_trained_model_cli_crops(data_root, run_dir, monkeypatch):
     from mlcast_verification_tools.cli import main
     from mlcast_verification_tools.io import open_scores

@@ -1120,6 +1120,8 @@ def verify_mlcast_model(
     precision: str = "fp32",
     persistence: bool = True,
     progress: bool = True,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> xr.Dataset:
     """
     Score an mlcast model on the cases of `dataset` without storing forecasts.
@@ -1178,6 +1180,12 @@ def verify_mlcast_model(
         waiting for data,
         in the model (including the transfer to the device and de-normalisation) and
         in the scores. The timing synchronises CUDA once per stage and batch.
+    rank, world_size : int
+        Score only the cases ``rank::world_size`` of `dataset`, as process `rank` of a
+        run on `world_size` devices (``verify-trained-model --devices``); the scores
+        of the processes are concatenated along ``init_time``. The random numbers
+        (ensemble noise, rank-histogram tie breaking) are seeded with ``seed + rank``,
+        so the model's scores differ from a single-process run by sampling noise.
 
     Returns
     -------
@@ -1197,7 +1205,7 @@ def verify_mlcast_model(
             variable=dataset.score_variable,
             units=dataset.units,
             zero_threshold=dataset.zero_threshold,
-            seed=seed,
+            seed=seed + rank,
             compute_psd=compute_psd,
             # crop mode: the scores of the crops of an init time are pooled
             pool_by_init_time=dataset.crop_size is not None,
@@ -1219,6 +1227,8 @@ def verify_mlcast_model(
         desc=f"verifying {forecast_source}",
         consumer="score",
         baseline=PERSISTENCE_SOURCE if persistence else None,
+        rank=rank,
+        world_size=world_size,
     )
     with torch.inference_mode():
         for batch in batches:
@@ -1267,13 +1277,16 @@ def _iter_forecasts(
     desc: str = "forecasting",
     consumer: str = "score",
     baseline: str | None = None,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> Iterator[_Batch]:
     """
     Run the model over the cases of `dataset`, batch by batch.
 
-    Seeds torch's global RNG with `seed` before the first batch, so the same
+    Seeds torch's global RNG with ``seed + rank`` before the first batch, so the same
     arguments give the same ensemble. Each batch is computed in inference mode;
     consumers that modify the tensors in place should also run in inference mode.
+    With ``world_size > 1`` only the cases ``rank::world_size`` are run.
 
     With `progress`, the progress bar shows the mean time per batch spent waiting for
     the DataLoader (``data``), in the model (``model``) and in the consumer of the
@@ -1291,6 +1304,10 @@ def _iter_forecasts(
         In crop mode B counts crops (of one case), cut out of the full-domain tensors.
     """
     _check_precision(precision)
+    if not 0 <= rank < world_size:
+        raise ValueError(f"rank must be in [0, {world_size}), got {rank}")
+    if world_size > len(dataset):
+        raise ValueError(f"{len(dataset)} cases cannot be split over {world_size} processes")
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     model = model.to(device).eval()
     chunks = _member_chunks(ensemble_size, member_chunk)
@@ -1304,6 +1321,11 @@ def _iter_forecasts(
         worker_kwargs = {"multiprocessing_context": "spawn", "persistent_workers": False}
     if crop_mode:
         worker_kwargs["collate_fn"] = _collate_with_crops
+    if world_size > 1:
+        # strided, so every process gets cases from the whole period; no case is repeated
+        # (unlike torch's DistributedSampler, which pads the shards to equal length)
+        worker_kwargs["sampler"] = range(rank, len(dataset), world_size)
+    n_cases = len(range(rank, len(dataset), world_size))
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -1327,6 +1349,7 @@ def _iter_forecasts(
             device=device,
             precision=precision,
             baseline=baseline,
+            world_size=world_size,
         )
         try:
             from tqdm.auto import tqdm
@@ -1336,7 +1359,7 @@ def _iter_forecasts(
             pass
     timer = _StageTimer(device, ("data", "model", consumer)) if bar is not None else None
     started = time.perf_counter()
-    torch.manual_seed(seed)  # also seeds all CUDA devices
+    torch.manual_seed(seed + rank)  # also seeds all CUDA devices
     if timer:
         timer.start()
     for batch in batches:
@@ -1376,11 +1399,11 @@ def _iter_forecasts(
     elapsed = time.perf_counter() - started
     logger.info(
         "{} done: {} cases{} in {} ({:.2f} s/case{})",
-        desc[0].upper() + desc[1:],
-        len(dataset),
-        f" ({dataset.n_crops} crops)" if crop_mode else "",
+        desc[0].upper() + desc[1:] + (f" [process {rank}/{world_size}]" if world_size > 1 else ""),
+        n_cases,
+        f" ({dataset.n_crops} crops)" if crop_mode and world_size == 1 else "",
         datetime.timedelta(seconds=round(elapsed)),
-        elapsed / len(dataset),
+        elapsed / n_cases,
         f"; per batch: {timer.summary()}" if timer else "",
     )
 
@@ -1411,6 +1434,7 @@ def _print_summary(
     device: torch.device,
     precision: str,
     baseline: str | None = None,
+    world_size: int = 1,
 ) -> None:
     """Print a panel of what is about to be forecast to stderr, as mlcast's sampler does."""
     from rich.console import Console
@@ -1432,6 +1456,8 @@ def _print_summary(
     device_label = str(device)
     if device.type == "cuda":
         device_label += f" ({torch.cuda.get_device_name(device)})"
+    if world_size > 1:
+        device_label += f"   × {world_size} processes, each scoring every {world_size}th case"
 
     grid = Table.grid(padding=(0, 2))
     grid.add_column(justify="right", style="bold cyan")
@@ -1473,8 +1499,10 @@ def _print_summary(
         f"🧮  {n_cases:,} cases × {ensemble_size} members × {dataset.forecast_steps} steps"
         f" = {n_cases * ensemble_size * dataset.forecast_steps:,} fields of {h:,} × {w:,}",
     )
+    per_process = " per process" if world_size > 1 else ""
     grid.add_row(
-        "Batches", f"📦  {n_batches:,} × {batch_size} cases   {num_workers} loader workers"
+        "Batches",
+        f"📦  {n_batches:,} × {batch_size} cases{per_process}   {num_workers} loader workers",
     )
     grid.add_row(
         "Device",
@@ -2084,7 +2112,64 @@ def verify_mlcast_run(
 # ---------------------------------------------------------------------------
 
 
-def _prepare_run_from_args(args: argparse.Namespace) -> _Run:
+def _launch_fabric(args: argparse.Namespace):
+    """
+    Start the processes of a multi-device run (``--devices``/``--num-nodes``).
+
+    Returns the Lightning ``Fabric`` of this process, or None for a single device. Run
+    as a script, Fabric re-runs the command line once per further local device; under
+    ``torchrun`` or SLURM ``srun`` the processes are already there and it only joins
+    them. The process group is set up, and each process is bound to its device.
+    """
+    if args.devices < 1 or args.num_nodes < 1:
+        raise SystemExit("--devices and --num-nodes must be at least 1")
+    if args.devices == 1 and args.num_nodes == 1:
+        return None
+    from lightning_fabric import Fabric
+
+    if args.device is None:
+        accelerator = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        device = torch.device(args.device)
+        if device.index is not None:
+            raise SystemExit(
+                f"--device {args.device}: with --devices give only the device type (cuda/cpu)"
+            )
+        accelerator = device.type
+    fabric = Fabric(
+        accelerator=accelerator, devices=args.devices, num_nodes=args.num_nodes, strategy="ddp"
+    )
+    fabric.launch()
+    return fabric
+
+
+def _gather_scores(scores: xr.Dataset) -> xr.Dataset | None:
+    """
+    Concatenate the score datasets of all processes along ``init_time``, on rank 0.
+
+    Each process scored different cases (:func:`verify_mlcast_model` with `rank` and
+    `world_size`). Returns None on the other ranks.
+    """
+    import torch.distributed as dist
+
+    gathered: list[xr.Dataset | None] = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered, scores)
+    if dist.get_rank() != 0:
+        return None
+    merged = xr.concat(
+        gathered,
+        dim=cv.INIT_TIME,
+        data_vars="minimal",
+        coords="minimal",
+        compat="override",
+        combine_attrs="override",
+    )
+    return merged.sortby(cv.INIT_TIME)
+
+
+def _prepare_run_from_args(
+    args: argparse.Namespace, device: str | torch.device | None = None
+) -> _Run:
     region = {k: v for k, v in (("y", args.region_y), ("x", args.region_x)) if v is not None}
     crop_kwargs: dict[str, Any] = {}
     if getattr(args, "crops", False):  # verify-trained-model only
@@ -2098,7 +2183,7 @@ def _prepare_run_from_args(args: argparse.Namespace) -> _Run:
         args.checkpoint,
         split=args.split,
         forecast_source=args.forecast_source,
-        device=args.device,
+        device=device or args.device,
         max_cases=args.max_cases,
         forecast_steps=args.forecast_steps,
         data_root=args.data_root,
@@ -2128,7 +2213,9 @@ def verify_trained_model_from_args(args: argparse.Namespace) -> int:
     """
     from ..io import write_scores
 
-    run = _prepare_run_from_args(args)
+    fabric = _launch_fabric(args)
+    rank, world_size = (fabric.global_rank, fabric.world_size) if fabric else (0, 1)
+    run = _prepare_run_from_args(args, device=fabric.device if fabric else None)
     scores = verify_mlcast_model(
         run.model,
         run.dataset,
@@ -2142,9 +2229,17 @@ def verify_trained_model_from_args(args: argparse.Namespace) -> int:
         member_chunk=args.member_chunk,
         precision=args.precision,
         persistence=not args.no_persistence,
-        progress=not args.no_progress,
+        progress=not args.no_progress and rank == 0,
+        rank=rank,
+        world_size=world_size,
     )
+    if fabric is not None:
+        scores = _gather_scores(scores)
+        if scores is None:  # not rank 0: rank 0 writes the scores
+            return 0
     forecasts = args.forecasts or _describe_forecasts(run, args.ensemble_size, args.precision)
+    if world_size > 1 and not args.forecasts:
+        forecasts += f", scored in {world_size} processes (ensemble seeds {args.seed}+rank)"
     if not args.no_persistence and not args.forecasts:
         forecasts += f"; {PERSISTENCE_SOURCE}: {_PERSISTENCE_DESCRIPTION}"
     path = write_scores(

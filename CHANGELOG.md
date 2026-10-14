@@ -23,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `verify-trained-model --devices N [--num-nodes M]`: score on several GPUs (or nodes)
+  in parallel with Lightning Fabric, each process scoring every N-th case
+  (`verify_mlcast_model(rank=, world_size=)`), the scores gathered along `init_time`.
 - `verify-trained-model` (`verify_mlcast_run`, `verify_mlcast_model`) scores the
   persistence baseline by default, as forecast source `persistence`: the last observed
   input frame at every lead time, on the same cases, pixels and crops as the model;

@@ -251,6 +251,11 @@ time scales with cases × members × lead times × grid size. To make it faster:
   GPUs with bf16 tensor cores (A100, H100); the forecasts are scored in float32.
 - `--num-workers 2` to `4` overlaps reading the source data with the GPU; more workers
   do not help when the model dominates.
+- `--devices N` scores on N GPUs in parallel (and `--num-nodes`, e.g. under SLURM
+  `srun`): Lightning Fabric starts one process per GPU, each scoring every N-th case,
+  and the first process gathers the scores and writes the file. The ensemble of each
+  process is seeded with `--seed` + its rank, so the model's scores differ from a
+  single-GPU run by sampling noise. Only `verify-trained-model` runs on several devices.
 
 `--forecast-steps`
 unrolls the model beyond its training horizon. `examples/mlcast_gpu.py` shows both

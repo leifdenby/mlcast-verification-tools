@@ -276,6 +276,22 @@ def build_verify_trained_model_parser(
         prog=prog, description=VERIFY_HELP[0].upper() + VERIFY_HELP[1:] + ".", add_help=add_help
     )
     _add_run_arguments(parser, "verify on")
+    g = parser.add_argument_group("multiple devices (default: one process on --device)")
+    g.add_argument(
+        "--devices",
+        type=int,
+        default=1,
+        help="number of devices (GPUs) per node to score on in parallel: Lightning Fabric "
+        "starts one process per device, each scoring every N-th case, and the first gathers "
+        "the scores and writes them (default: 1); --device then only gives the device "
+        "type (cuda or cpu)",
+    )
+    g.add_argument(
+        "--num-nodes",
+        type=int,
+        default=1,
+        help="number of nodes, e.g. under SLURM `srun` (default: 1)",
+    )
     g = parser.add_argument_group("crops (default: forecast the full domain at each init time)")
     g.add_argument(
         "--crops",
